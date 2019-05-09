@@ -72,7 +72,6 @@ getSources = do
       Just _ -> abortSourcesIsntAMap
       Nothing -> abortSourcesIsntJSON
 
--- TODO: pretty
 setSources :: Sources -> IO ()
 setSources sources = encodeFile pathNixSourcesJson sources
 
