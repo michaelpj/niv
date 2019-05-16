@@ -1,4 +1,7 @@
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ApplicativeDo #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
@@ -147,6 +150,268 @@ parsePackage = (,) <$> parsePackageName <*> parsePackageSpec
 -- PACKAGE SPEC OPS
 -------------------------------------------------------------------------------
 
+data Result a
+  = Pure a
+  | Failed
+  | Io (IO a)
+  | Set T.Text T.Text (Result a)
+  | Load T.Text (Maybe T.Text -> Result a)
+  | Bind (Bind a)
+  | App (App a)
+  | Alt (Result a) (Result a)
+
+
+data Bind a = forall b. Bin (Result b) (b -> Result a)
+
+instance Functor Bind where
+  fmap f (Bin l r) = Bin l (fmap f . r)
+
+data App a = forall b. Ap (Result (b -> a)) (Result b)
+
+instance Functor App where
+  fmap f (Ap l r) = Ap (fmap (f .) l) r
+
+instance Alternative Result where
+  empty = Failed
+  l <|> r = Alt l r
+
+instance Functor Result where
+  fmap f (Pure x) = Pure (f x)
+  fmap f (Io x) = Io $ f <$> x
+  fmap f (Set k v x) = Set k v (f <$> x)
+  fmap f (Load k n) = Load k (fmap f . n)
+  fmap _ Failed = Failed
+  fmap f (Bind t) = Bind (fmap f t)
+  fmap f (App t) = App (fmap f t)
+  fmap f (Alt l r) = Alt (f <$> l) (f <$> r)
+
+instance Applicative Result where
+  pure = Pure
+  l <*> r = App (Ap l r)
+
+-- XXX: not a true monad
+instance Monad Result where
+  l >>= r = Bind (Bin l r)
+
+-- newtype ResultState
+type Foo = HMS.HashMap T.Text Val
+
+data Val
+  = Locked T.Text
+  | CLILocked T.Text
+  | TransLocked T.Text
+  | Setted T.Text
+  | Free T.Text
+  | Nada
+  deriving (Eq, Show)
+
+execResult :: Foo -> Result a -> IO a
+execResult foo r = snd <$> runResult foo r
+
+runResult :: Foo -> Result a -> IO (Foo, a)
+runResult foo r = runResult' foo r >>= \case
+  Left () -> error "bad"
+  Right v -> pure v
+
+runResult' :: Foo -> Result a -> IO (Either () (Foo, a))
+runResult' foo = \case
+  (Pure x) -> pure $ Right (foo, x)
+  (Io x) -> (Right . (foo,)) <$> x
+  (Set k v x) -> runResult' (HMS.singleton k (Setted v) <> foo) x -- TODO
+  (Load k f) -> runResult' foo (f (lookupVal k foo)) -- TODO
+  (App (Ap l r)) -> do
+    runResult' foo l >>= \case
+      Left () -> pure $ Left ()
+      Right (foo', f) -> fmap (fmap f) <$> runResult' foo' r
+  (Bind (Bin l r)) -> do
+    runResult' foo l >>= \case
+      Left () -> pure $ Left ()
+      Right (foo', x) -> runResult' foo' (r x)
+  Failed -> pure $ Left ()
+  Alt l r -> do
+    runResult' foo l >>= \case
+      Left () -> runResult' foo r
+      Right v -> pure $ Right v
+
+lookupVal :: T.Text -> Foo -> Maybe T.Text
+lookupVal k m = case HMS.lookup k m of
+  Nothing -> Nothing
+  Just v -> case v of
+    Locked t -> Just t
+    CLILocked t -> Just t
+    TransLocked t -> Just t
+    Setted t -> Just t
+    Free t -> Just t
+    Nada -> Nothing
+
+test :: IO ()
+test = do
+  test1
+  test2
+  test3
+  test4
+  test5
+  test6
+  test7
+
+test1 :: IO ()
+test1 = do
+    res <- execResult foo $ pure 2
+    print (res :: Int)
+    unless (res == 2) $ error "bad value"
+  where
+    foo = HMS.empty
+
+test2 :: IO ()
+test2 = do
+    res <- execResult foo $ do
+      load "bar"
+    T.putStrLn res
+    unless (res == "baz") $ error "bad value"
+  where
+    foo = HMS.singleton "bar" (Free "baz")
+
+test3 :: IO ()
+test3 = do
+    res <- execResult foo $ do
+      3 <$ empty <|> pure 2
+    print (res :: Int)
+    unless (res == 2) $ error "bad value"
+  where
+    foo = HMS.empty
+
+test4 :: IO ()
+test4 = do
+    (foo', ()) <- runResult foo $ do
+      set "baz" "foo"
+    unless (HMS.lookup "baz" foo' == Just (Setted "foo")) $ error "bad value"
+  where
+    foo = HMS.singleton "baz" (Free "not-foo")
+
+test5 :: IO ()
+test5 = do
+    (foo', ()) <- runResult foo $ do
+      (do
+        v <- load "val"
+        guard (v == "left")
+        set "res" "I saw left"
+        ) <|> (do
+        v <- load "val"
+        guard (v == "right")
+        set "res" "I saw right"
+        )
+
+    print foo'
+    unless
+      (HMS.lookup "res" foo' == Just (Setted "I saw right"))
+      (error "bad value")
+  where
+    foo = HMS.singleton "val" (Free "right")
+
+test6 :: IO ()
+test6 = do
+    (foo', ()) <- runResult foo $ do
+
+      owner <- load "owner" -- LOAD, must exist already
+      repo <- load "repo" -- LOAD, must exist already
+      branch <- load "branch" <|> pure "master" -- LOAD or master
+      set "branch" branch -- SET the branch
+      let url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+
+      set "url_template" url_template -- SET the url_template, even if it exists, unless locked
+
+      rev <- io $ pure ("some-rev" <> owner <> repo <> branch)
+
+      set "rev" rev
+
+      pure ()
+
+    print foo'
+  where
+    foo = HMS.fromList
+      [ ("owner", Free "nmattia")
+      , ("repo", Free "niv")
+      , ("branch", Free "master")
+      ]
+
+test7 :: IO ()
+test7 = do
+    (foo', ()) <- runResult foo $ do
+
+      owner <- load "owner" -- LOAD, must exist already
+      repo <- load "repo" -- LOAD, must exist already
+      branch <- load "branch" <|> pure "master" -- LOAD or master
+      set "branch" branch -- SET the branch
+      let url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+
+      set "url_template" url_template -- SET the url_template, even if it exists, unless locked
+
+      rev <- io $ pure ("some-rev" <> owner <> repo <> branch)
+
+      set "rev" rev
+
+      pure ()
+
+    print foo'
+    unless (HMS.lookup "rev" foo' == Just (Locked "basic")) $ error "bad"
+  where
+    foo = HMS.fromList
+      [ ("owner", Free "nmattia")
+      , ("repo", Free "niv")
+      , ("branch", Free "master")
+      , ("rev", Locked "basic")
+      ]
+
+load :: T.Text -> Result T.Text
+load k = Load k $ maybe Failed Pure
+
+set :: T.Text -> T.Text -> Result ()
+set k v = Set k v (pure ())
+
+io :: IO a -> Result a
+io = Io
+
+describe :: Result a -> T.Text
+describe = \case
+  (Alt r l) -> "Alt!" <> describe l <> describe r
+  (Pure _) -> "Pure!"
+  (Io _) -> "IO!"
+  (Set k _ n) -> "Setting " <> k <> ", then " <> describe n
+  (Load k n) -> T.unlines
+    [ "Loading " <> k <> ","
+    , "  if successful then " <> describe (n (Just "bar"))
+    , "  else " <> describe (n Nothing)
+    ]
+  (App (Ap l r)) -> "App!" <>
+    "(L " <> describe l <> ")" <>
+    "(R " <> describe r <> ")"
+  (Bind (Bin l _)) -> "Bind!" <>
+    "(L " <> describe l <> ")"
+  Failed -> "Failed :("
+
+githubUpdate :: Result ()
+githubUpdate = do
+    owner <- load "owner" -- LOAD, must exist already
+    repo <- load "repo" -- LOAD, must exist already
+    branch <- load "branch" <|> pure "master" -- LOAD or master
+    set "branch" branch -- SET the branch
+    let url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+
+    set "url_template" "foo" -- SET the url_template, even if it exists, unless locked
+
+    rev <- io $ githubLatestRev owner repo branch
+
+    -- SET the rev, even if it exists, unless the rev is locked
+    set "rev" "dummy"
+
+    -- doUnpack <-
+      -- (pure True)
+
+    -- SET the sha256, only if the pure dependencies have change
+    -- sha256 <- fmap T.pack . io $ nixPrefetchURL True "foo"
+    -- set "sha256" sha256
+    -- pure ()
+
 updatePackageSpec :: PackageSpec -> IO PackageSpec
 updatePackageSpec = execStateT $ do
     originalUrl <- getPackageSpecAttr "url"
@@ -232,14 +497,9 @@ completePackageSpec = execStateT $ do
 
                 withPackageSpecAttr "branch" (\case
                   Aeson.String branch -> do
-                    liftIO (GH.executeRequest' $
-                      GH.commitsWithOptionsForR
-                      (GH.N owner) (GH.N repo) (GH.FetchAtLeast 1)
-                      [GH.CommitQuerySha branch]) >>= \case
-                        Right (toList -> (commit:_)) -> do
-                          let GH.N rev = GH.commitSha commit
-                          setPackageSpecAttr "rev" (Aeson.String rev)
-                        _ -> pure ()
+                    liftIO (githubLatestRev owner repo branch) >>= \case
+                      Just rev -> setPackageSpecAttr "rev" (Aeson.String rev)
+                      Nothing -> pure ()
                   _ -> pure ()
                   )
       (_,_) -> pure ()
@@ -254,6 +514,26 @@ completePackageSpec = execStateT $ do
     githubURLTemplate :: T.Text
     githubURLTemplate =
       "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+
+-- | Get the latest revision for owner, repo and branch.
+-- TODO: explain no error handling
+githubLatestRev
+  :: T.Text
+  -- ^ owner
+  -> T.Text
+  -- ^ repo
+  -> T.Text
+  -- ^ branch
+  -> IO (Maybe T.Text)
+githubLatestRev owner repo branch =
+    GH.executeRequest' (
+      GH.commitsWithOptionsForR (GH.N owner) (GH.N repo) (GH.FetchAtLeast 1)
+      [GH.CommitQuerySha branch]
+      ) >>= \case
+        Right (toList -> (commit:_)) -> do
+          let GH.N rev = GH.commitSha commit
+          pure $ Just rev
+        _ -> pure Nothing
 
 -------------------------------------------------------------------------------
 -- PackageSpec State helpers
