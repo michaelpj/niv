@@ -152,19 +152,23 @@ parsePackage = (,) <$> parsePackageName <*> parsePackageSpec
 
 data Result a
   = Pure a
-  | Failed
-  | Io (IO a)
-  | Set T.Text T.Text (Result a)
-  | Load T.Text (Maybe T.Text -> Result a)
-  | Bind (Bind a)
+  | Check Check (Result a)
+  | Failed Failure
+  | Io (Io a)
+  | Set T.Text (Result T.Text) (Result a)
+  | Load T.Text (T.Text -> Result a)
   | App (App a)
   | Alt (Result a) (Result a)
 
+check :: Result a -> (a -> Bool) -> Result b -> Result b
+check r ch next = Check (Chec r ch) next
 
-data Bind a = forall b. Bin (Result b) (b -> Result a)
+data Check = forall b. Chec (Result b) (b -> Bool)
 
-instance Functor Bind where
-  fmap f (Bin l r) = Bin l (fmap f . r)
+data Io a = forall b. I (Result b) (b -> IO a)
+
+instance Functor Io where
+  fmap f (I r i) = I r (fmap f . i)
 
 data App a = forall b. Ap (Result (b -> a)) (Result b)
 
@@ -172,16 +176,16 @@ instance Functor App where
   fmap f (Ap l r) = Ap (fmap (f .) l) r
 
 instance Alternative Result where
-  empty = Failed
+  empty = Failed AltEmpty
   l <|> r = Alt l r
 
 instance Functor Result where
   fmap f (Pure x) = Pure (f x)
+  fmap f (Check c next) = Check c (f <$> next)
   fmap f (Io x) = Io $ f <$> x
   fmap f (Set k v x) = Set k v (f <$> x)
   fmap f (Load k n) = Load k (fmap f . n)
-  fmap _ Failed = Failed
-  fmap f (Bind t) = Bind (fmap f t)
+  fmap _ (Failed f) = Failed f
   fmap f (App t) = App (fmap f t)
   fmap f (Alt l r) = Alt (f <$> l) (f <$> r)
 
@@ -189,11 +193,6 @@ instance Applicative Result where
   pure = Pure
   l <*> r = App (Ap l r)
 
--- XXX: not a true monad
-instance Monad Result where
-  l >>= r = Bind (Bin l r)
-
--- newtype ResultState
 type Foo = HMS.HashMap T.Text Val
 
 data Val
@@ -202,47 +201,73 @@ data Val
   | TransLocked T.Text
   | Setted T.Text
   | Free T.Text
-  | Nada
   deriving (Eq, Show)
+
+data Failure
+  = AltEmpty
+  | NoSuchKey T.Text
+  | SettingLocked T.Text
+  deriving Show
 
 execResult :: Foo -> Result a -> IO a
 execResult foo r = snd <$> runResult foo r
 
 runResult :: Foo -> Result a -> IO (Foo, a)
 runResult foo r = runResult' foo r >>= \case
-  Left () -> error "bad"
+  Left f -> error $ show f
   Right v -> pure v
 
-runResult' :: Foo -> Result a -> IO (Either () (Foo, a))
+runResult' :: Foo -> Result a -> IO (Either Failure (Foo, a))
 runResult' foo = \case
   (Pure x) -> pure $ Right (foo, x)
-  (Io x) -> (Right . (foo,)) <$> x
-  (Set k v x) -> runResult' (HMS.singleton k (Setted v) <> foo) x -- TODO
-  (Load k f) -> runResult' foo (f (lookupVal k foo)) -- TODO
+  (Check (Chec v ch) next) -> do
+    runResult' foo v >>= \case
+      Left f -> pure $ Left f
+      Right (foo', v') ->
+        if ch v'
+        then runResult' foo' next
+        else pure $ Left AltEmpty
+  (Io (I r i)) -> do
+    runResult' foo r >>= \case
+      Left f -> pure $ Left f
+      Right (foo', v) -> do
+        v' <- i v
+        runResult' foo' (Pure v')
+  (Set k v x) -> do
+    runResult' foo v >>= \case
+      Left f -> pure $ Left f
+      Right (foo', v') -> case HMS.lookup k foo' of
+        Just (Locked {}) -> pure $ Left $ SettingLocked k-- TODO: CLI Locked as well
+        _ -> runResult' (HMS.singleton k (Setted v') <> foo') x -- TODO
+  (Load k f) -> case lookupVal k foo of
+    Just v -> runResult' foo (f v) -- TODO
+    Nothing -> pure $ Left (NoSuchKey k) -- TODO
   (App (Ap l r)) -> do
     runResult' foo l >>= \case
-      Left () -> pure $ Left ()
+      Left (SettingLocked k) -> do -- TODO: compare failed state with actual
+        T.putStrLn $ "Skipping setting for locked: " <> k
+        error "foo"
+        -- fmap
+
+        -- pure $ Left f
+      Left f -> pure $ Left f
       Right (foo', f) -> fmap (fmap f) <$> runResult' foo' r
-  (Bind (Bin l r)) -> do
-    runResult' foo l >>= \case
-      Left () -> pure $ Left ()
-      Right (foo', x) -> runResult' foo' (r x)
-  Failed -> pure $ Left ()
+  Failed f -> pure $ Left f
   Alt l r -> do
     runResult' foo l >>= \case
-      Left () -> runResult' foo r
+      Left AltEmpty -> runResult' foo r
+      Left f -> pure $ Left f
       Right v -> pure $ Right v
 
 lookupVal :: T.Text -> Foo -> Maybe T.Text
 lookupVal k m = case HMS.lookup k m of
   Nothing -> Nothing
-  Just v -> case v of
-    Locked t -> Just t
-    CLILocked t -> Just t
-    TransLocked t -> Just t
-    Setted t -> Just t
-    Free t -> Just t
-    Nada -> Nothing
+  Just v -> Just $ case v of
+    Locked t -> t
+    CLILocked t -> t
+    TransLocked t -> t
+    Setted t -> t
+    Free t -> t
 
 test :: IO ()
 test = do
@@ -283,22 +308,19 @@ test3 = do
 test4 :: IO ()
 test4 = do
     (foo', ()) <- runResult foo $ do
-      set "baz" "foo"
+      set "baz" (pure "foo")
     unless (HMS.lookup "baz" foo' == Just (Setted "foo")) $ error "bad value"
   where
     foo = HMS.singleton "baz" (Free "not-foo")
 
 test5 :: IO ()
 test5 = do
-    (foo', ()) <- runResult foo $ do
-      (do
-        v <- load "val"
-        guard (v == "left")
-        set "res" "I saw left"
-        ) <|> (do
-        v <- load "val"
-        guard (v == "right")
-        set "res" "I saw right"
+    (foo', ()) <- runResult foo $
+
+      (check (load "val") (== "left") $
+        set "res" (pure "I saw left")
+        ) <|> (check (load "val") (== "right") $
+        set "res" (pure "I saw right")
         )
 
     print foo'
@@ -312,17 +334,15 @@ test6 :: IO ()
 test6 = do
     (foo', ()) <- runResult foo $ do
 
-      owner <- load "owner" -- LOAD, must exist already
-      repo <- load "repo" -- LOAD, must exist already
-      branch <- load "branch" <|> pure "master" -- LOAD or master
-      set "branch" branch -- SET the branch
+      -- let owner = load "owner" -- LOAD, must exist already
+      -- let repo = load "repo" -- LOAD, must exist already
+      let branch = load "branch" <|> pure "master" -- LOAD or master
+      set "branch" branch
       let url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
 
-      set "url_template" url_template -- SET the url_template, even if it exists, unless locked
+      set "url_template" (pure url_template) -- SET the url_template, even if it exists, unless locked
 
-      rev <- io $ pure ("some-rev" <> owner <> repo <> branch)
-
-      set "rev" rev
+      set "rev" $ io (pure ()) $ \() ->  pure "foobar" -- ("some-rev" <> owner <> repo <> branch)
 
       pure ()
 
@@ -336,22 +356,26 @@ test6 = do
 
 test7 :: IO ()
 test7 = do
-    (foo', ()) <- runResult foo $ do
+    let fooz = do
+          let
+            owner = load "owner"
+            repo = load "repo"
+            branch = load "branch" <|> pure "master"
+          set "branch" branch
+          let url_template = pure "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
 
-      owner <- load "owner" -- LOAD, must exist already
-      repo <- load "repo" -- LOAD, must exist already
-      branch <- load "branch" <|> pure "master" -- LOAD or master
-      set "branch" branch -- SET the branch
-      let url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+          set "url_template" url_template -- SET the url_template, even if it exists, unless locked
 
-      set "url_template" url_template -- SET the url_template, even if it exists, unless locked
+          set "rev" $ io ((,,) <$> owner <*> repo <*> branch) $
+            \(_, _, _) -> pure "foobar"
 
-      rev <- io $ pure ("some-rev" <> owner <> repo <> branch)
 
-      set "rev" rev
+          set "foo" (pure "bar")
+          pure ()
 
-      pure ()
+    T.putStrLn $ describe fooz
 
+    (foo', ()) <- runResult foo $ fooz
     print foo'
     unless (HMS.lookup "rev" foo' == Just (Locked "basic")) $ error "bad"
   where
@@ -363,47 +387,44 @@ test7 = do
       ]
 
 load :: T.Text -> Result T.Text
-load k = Load k $ maybe Failed Pure
+load k = Load k Pure
 
-set :: T.Text -> T.Text -> Result ()
+set :: T.Text -> Result T.Text -> Result ()
 set k v = Set k v (pure ())
 
-io :: IO a -> Result a
-io = Io
+io :: Result a -> (a -> IO b) -> Result b
+io r f = Io (I r f)
 
 describe :: Result a -> T.Text
 describe = \case
   (Alt r l) -> "Alt!" <> describe l <> describe r
+  (Check _ _) -> "Check!"
   (Pure _) -> "Pure!"
   (Io _) -> "IO!"
   (Set k _ n) -> "Setting " <> k <> ", then " <> describe n
   (Load k n) -> T.unlines
     [ "Loading " <> k <> ","
-    , "  if successful then " <> describe (n (Just "bar"))
-    , "  else " <> describe (n Nothing)
+    , "  " <> describe (n "bar")
     ]
   (App (Ap l r)) -> "App!" <>
     "(L " <> describe l <> ")" <>
     "(R " <> describe r <> ")"
-  (Bind (Bin l _)) -> "Bind!" <>
-    "(L " <> describe l <> ")"
-  Failed -> "Failed :("
+  Failed f -> "Failed :(" <> tshow f
 
 githubUpdate :: Result ()
 githubUpdate = do
-    owner <- load "owner" -- LOAD, must exist already
-    repo <- load "repo" -- LOAD, must exist already
-    branch <- load "branch" <|> pure "master" -- LOAD or master
+    let branch = load "branch" <|> pure "master" -- LOAD or master
     set "branch" branch -- SET the branch
     let url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
 
-    set "url_template" "foo" -- SET the url_template, even if it exists, unless locked
+    set "url_template" (pure url_template) -- SET the url_template, even if it exists, unless locked
 
-    rev <- io $ githubLatestRev owner repo branch
+    let rev = io (pure ()) $ \() -> pure "foo"
 
     -- SET the rev, even if it exists, unless the rev is locked
-    set "rev" "dummy"
+    set "rev" rev
 
+    pure ()
     -- doUnpack <-
       -- (pure True)
 
