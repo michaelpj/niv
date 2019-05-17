@@ -198,7 +198,6 @@ type Foo = HMS.HashMap T.Text Val
 data Val
   = Locked T.Text
   | CLILocked T.Text
-  | TransLocked T.Text
   | Setted T.Text
   | Free T.Text
   deriving (Eq, Show)
@@ -206,7 +205,6 @@ data Val
 data Failure
   = AltEmpty
   | NoSuchKey T.Text
-  | SettingLocked T.Text
   deriving Show
 
 execResult :: Foo -> Result a -> IO a
@@ -237,19 +235,13 @@ runResult' foo = \case
     runResult' foo v >>= \case
       Left f -> pure $ Left f
       Right (foo', v') -> case HMS.lookup k foo' of
-        Just (Locked {}) -> pure $ Left $ SettingLocked k-- TODO: CLI Locked as well
+        Just (Locked {}) -> runResult' (foo') x
         _ -> runResult' (HMS.singleton k (Setted v') <> foo') x -- TODO
   (Load k f) -> case lookupVal k foo of
     Just v -> runResult' foo (f v) -- TODO
     Nothing -> pure $ Left (NoSuchKey k) -- TODO
   (App (Ap l r)) -> do
     runResult' foo l >>= \case
-      Left (SettingLocked k) -> do -- TODO: compare failed state with actual
-        T.putStrLn $ "Skipping setting for locked: " <> k
-        error "foo"
-        -- fmap
-
-        -- pure $ Left f
       Left f -> pure $ Left f
       Right (foo', f) -> fmap (fmap f) <$> runResult' foo' r
   Failed f -> pure $ Left f
@@ -265,7 +257,6 @@ lookupVal k m = case HMS.lookup k m of
   Just v -> Just $ case v of
     Locked t -> t
     CLILocked t -> t
-    TransLocked t -> t
     Setted t -> t
     Free t -> t
 
@@ -386,6 +377,38 @@ test7 = do
       , ("rev", Locked "basic")
       ]
 
+test8 :: IO ()
+test8 = do
+    let fooz = do
+          let
+            someio = io (pure ()) (\() -> pure "new")
+          set "val1" $ fmap ("1-" <>) someio
+          set "val2" $ fmap ("2-" <>) someio
+          pure ()
+
+    T.putStrLn $ describe fooz
+
+    (foo', ()) <- runResult foo $ fooz
+    print foo'
+    unless
+      ( HMS.lookup "val1" foo' == Just (Locked "1-old") &&
+        HMS.lookup "val2" foo' == Just (Locked "2-old")
+      ) $ error "bad"
+  where
+    foo = HMS.fromList
+      [ ("val1", Free "1-old")
+      , ("val2", Locked "2-old")
+      ]
+
+test9 :: IO ()
+test9 = do
+    let fooz = io (pure ()) (\() -> error "baz" >>pure ())
+
+    T.putStrLn $ describe fooz
+
+    (foo', ()) <- runResult HMS.empty $ fooz
+    print foo'
+
 load :: T.Text -> Result T.Text
 load k = Load k Pure
 
@@ -401,7 +424,7 @@ describe = \case
   (Check _ _) -> "Check!"
   (Pure _) -> "Pure!"
   (Io _) -> "IO!"
-  (Set k _ n) -> "Setting " <> k <> ", then " <> describe n
+  (Set k v n) -> "Setting " <> k <> " to " <> describe v <> ", then " <> describe n
   (Load k n) -> T.unlines
     [ "Loading " <> k <> ","
     , "  " <> describe (n "bar")
@@ -413,6 +436,9 @@ describe = \case
 
 githubUpdate :: Result ()
 githubUpdate = do
+    -- let
+      -- url = load "url"
+      -- urlTemplate
     let branch = load "branch" <|> pure "master" -- LOAD or master
     set "branch" branch -- SET the branch
     let url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
