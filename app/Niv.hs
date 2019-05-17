@@ -150,15 +150,15 @@ parsePackage = (,) <$> parsePackageName <*> parsePackageSpec
 -- PACKAGE SPEC OPS
 -------------------------------------------------------------------------------
 
-data Result a
-  = Pure a
-  | Check Check (Result a)
-  | Failed Failure
-  | Io (Io a)
-  | Set T.Text (Result T.Text) (Result a)
-  | Load T.Text (T.Text -> Result a)
-  | App (App a)
-  | Alt (Result a) (Result a)
+data Result a where
+  Pure :: a -> Result a
+  Check :: Check -> (Result a) -> Result a
+  Failed  :: Failure -> Result a
+  Io :: Io a -> Result a
+  Set :: T.Text -> Result T.Text -> Result ()
+  Load :: T.Text -> Result T.Text
+  App :: (App a) -> Result a
+  Alt :: Result a -> Result a -> Result a
 
 check :: Result a -> (a -> Bool) -> Result b -> Result b
 check r ch next = Check (Chec r ch) next
@@ -183,8 +183,8 @@ instance Functor Result where
   fmap f (Pure x) = Pure (f x)
   fmap f (Check c next) = Check c (f <$> next)
   fmap f (Io x) = Io $ f <$> x
-  fmap f (Set k v x) = Set k v (f <$> x)
-  fmap f (Load k n) = Load k (fmap f . n)
+  fmap f (Set k v) = App $ Ap (Pure f) (Set k v)
+  fmap f (Load k) = App $ Ap (Pure f) (Load k)
   fmap _ (Failed f) = Failed f
   fmap f (App t) = App (fmap f t)
   fmap f (Alt l r) = Alt (f <$> l) (f <$> r)
@@ -231,14 +231,14 @@ runResult' foo = \case
       Right (foo', v) -> do
         v' <- i v
         runResult' foo' (Pure v')
-  (Set k v x) -> do
+  (Set k v) -> do
     runResult' foo v >>= \case
       Left f -> pure $ Left f
       Right (foo', v') -> case HMS.lookup k foo' of
-        Just (Locked {}) -> runResult' (foo') x
-        _ -> runResult' (HMS.singleton k (Setted v') <> foo') x -- TODO
-  (Load k f) -> case lookupVal k foo of
-    Just v -> runResult' foo (f v) -- TODO
+        Just (Locked {}) -> pure $ Right (foo, ())
+        _ -> pure $ Right (HMS.singleton k (Setted v') <> foo', ())
+  (Load k) -> case lookupVal k foo of
+    Just v -> runResult' foo (Pure v) -- TODO
     Nothing -> pure $ Left (NoSuchKey k) -- TODO
   (App (Ap l r)) -> do
     runResult' foo l >>= \case
@@ -325,8 +325,6 @@ test6 :: IO ()
 test6 = do
     (foo', ()) <- runResult foo $ do
 
-      -- let owner = load "owner" -- LOAD, must exist already
-      -- let repo = load "repo" -- LOAD, must exist already
       let branch = load "branch" <|> pure "master" -- LOAD or master
       set "branch" branch
       let url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
@@ -402,7 +400,7 @@ test8 = do
 
 test9 :: IO ()
 test9 = do
-    let fooz = io (pure ()) (\() -> error "baz" >>pure ())
+    let fooz = io (pure ()) (\() -> error "baz" >> pure ())
 
     T.putStrLn $ describe fooz
 
@@ -410,10 +408,10 @@ test9 = do
     print foo'
 
 load :: T.Text -> Result T.Text
-load k = Load k Pure
+load k = Load k
 
 set :: T.Text -> Result T.Text -> Result ()
-set k v = Set k v (pure ())
+set k v = Set k v
 
 io :: Result a -> (a -> IO b) -> Result b
 io r f = Io (I r f)
@@ -424,11 +422,8 @@ describe = \case
   (Check _ _) -> "Check!"
   (Pure _) -> "Pure!"
   (Io _) -> "IO!"
-  (Set k v n) -> "Setting " <> k <> " to " <> describe v <> ", then " <> describe n
-  (Load k n) -> T.unlines
-    [ "Loading " <> k <> ","
-    , "  " <> describe (n "bar")
-    ]
+  (Set k v) -> "Setting " <> k <> " to " <> describe v
+  (Load k) -> "Loading " <> k
   (App (Ap l r)) -> "App!" <>
     "(L " <> describe l <> ")" <>
     "(R " <> describe r <> ")"
@@ -436,28 +431,27 @@ describe = \case
 
 githubUpdate :: Result ()
 githubUpdate = do
-    -- let
-      -- url = load "url"
-      -- urlTemplate
-    let branch = load "branch" <|> pure "master" -- LOAD or master
-    set "branch" branch -- SET the branch
-    let url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+    let
+      owner = load "owner"
+      repo = load "repo"
+      branch = load "branch" <|> pure "master" -- LOAD or master
+      url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
 
+    set "branch" branch -- SET the branch
     set "url_template" (pure url_template) -- SET the url_template, even if it exists, unless locked
 
-    let rev = io (pure ()) $ \() -> pure "foo"
+    let rev = io
+                ((,,) <$> owner <*> repo <*> branch) $
+                \(o,r,b) -> githubLatestRev o r b
 
     -- SET the rev, even if it exists, unless the rev is locked
     set "rev" rev
 
-    pure ()
-    -- doUnpack <-
-      -- (pure True)
+    let url = pure "someurl"
+    set "url" url
+    set "sha256" $ io url $ \u -> T.pack <$> nixPrefetchURL True (T.unpack u)
 
-    -- SET the sha256, only if the pure dependencies have change
-    -- sha256 <- fmap T.pack . io $ nixPrefetchURL True "foo"
-    -- set "sha256" sha256
-    -- pure ()
+    pure ()
 
 updatePackageSpec :: PackageSpec -> IO PackageSpec
 updatePackageSpec = execStateT $ do
@@ -545,8 +539,8 @@ completePackageSpec = execStateT $ do
                 withPackageSpecAttr "branch" (\case
                   Aeson.String branch -> do
                     liftIO (githubLatestRev owner repo branch) >>= \case
-                      Just rev -> setPackageSpecAttr "rev" (Aeson.String rev)
-                      Nothing -> pure ()
+                      rev -> setPackageSpecAttr "rev" (Aeson.String rev)
+                      -- Nothing -> pure () -- TODO check error?
                   _ -> pure ()
                   )
       (_,_) -> pure ()
@@ -571,7 +565,7 @@ githubLatestRev
   -- ^ repo
   -> T.Text
   -- ^ branch
-  -> IO (Maybe T.Text)
+  -> IO T.Text
 githubLatestRev owner repo branch =
     GH.executeRequest' (
       GH.commitsWithOptionsForR (GH.N owner) (GH.N repo) (GH.FetchAtLeast 1)
@@ -579,8 +573,8 @@ githubLatestRev owner repo branch =
       ) >>= \case
         Right (toList -> (commit:_)) -> do
           let GH.N rev = GH.commitSha commit
-          pure $ Just rev
-        _ -> pure Nothing
+          pure $ rev
+        _ -> error "No rev"
 
 -------------------------------------------------------------------------------
 -- PackageSpec State helpers
