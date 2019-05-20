@@ -1,4 +1,6 @@
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE Arrows #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ApplicativeDo #-}
@@ -10,7 +12,9 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ViewPatterns #-}
 
+import Control.Arrow
 import Control.Applicative
+import qualified Control.Category as Cat
 import Control.Monad
 import Control.Monad.State
 import Data.Aeson (FromJSON, FromJSONKey, ToJSON, ToJSONKey)
@@ -197,7 +201,6 @@ type Foo = HMS.HashMap T.Text Val
 
 data Val
   = Locked T.Text
-  | CLILocked T.Text
   | Setted T.Text
   | Free T.Text
   deriving (Eq, Show)
@@ -232,11 +235,12 @@ runResult' foo = \case
         v' <- i v
         runResult' foo' (Pure v')
   (Set k v) -> do
-    runResult' foo v >>= \case
-      Left f -> pure $ Left f
-      Right (foo', v') -> case HMS.lookup k foo' of
-        Just (Locked {}) -> pure $ Right (foo, ())
-        _ -> pure $ Right (HMS.singleton k (Setted v') <> foo', ())
+    case HMS.lookup k foo of
+      Just (Locked {}) -> pure $ Right (foo, ()) -- TODO: failed locked?
+      _ -> runResult' foo v >>= \case
+        Left f -> pure $ Left f
+        Right (foo', v') -> pure $ Right $
+          (HMS.singleton k (Setted v') <> foo', ())
   (Load k) -> case lookupVal k foo of
     Just v -> runResult' foo (Pure v) -- TODO
     Nothing -> pure $ Left (NoSuchKey k) -- TODO
@@ -256,7 +260,6 @@ lookupVal k m = case HMS.lookup k m of
   Nothing -> Nothing
   Just v -> Just $ case v of
     Locked t -> t
-    CLILocked t -> t
     Setted t -> t
     Free t -> t
 
@@ -379,9 +382,9 @@ test8 :: IO ()
 test8 = do
     let fooz = do
           let
-            someio = io (pure ()) (\() -> pure "new")
-          set "val1" $ fmap ("1-" <>) someio
-          set "val2" $ fmap ("2-" <>) someio
+            new = pure "new"
+          set "val1" $ fmap ("1-" <>) new
+          set "val2" $ fmap ("2-" <>) new
           pure ()
 
     T.putStrLn $ describe fooz
@@ -400,12 +403,26 @@ test8 = do
 
 test9 :: IO ()
 test9 = do
-    let fooz = io (pure ()) (\() -> error "baz" >> pure ())
+    let fooz = set "foo" (io (pure ()) (\() -> error "baz"))
 
     T.putStrLn $ describe fooz
 
-    (foo', ()) <- runResult HMS.empty $ fooz
+    (foo', ()) <- runResult foo $ fooz
     print foo'
+  where
+    foo = HMS.singleton "foo" (Locked "something")
+
+test9' :: IO ()
+test9' = do
+    let f = io' (const $ error "IO is too eager") >>> set' "foo"
+    -- let f = proc () -> do
+              -- ioval <- io' (\() -> error "IO is too eager!") -< ()
+              -- set' "foo" -< ioval
+    print f
+    (foo', ()) <- runDummy foo f
+    print foo'
+  where
+    foo = HMS.singleton "foo" (Locked "right")
 
 load :: T.Text -> Result T.Text
 load k = Load k
@@ -428,6 +445,197 @@ describe = \case
     "(L " <> describe l <> ")" <>
     "(R " <> describe r <> ")"
   Failed f -> "Failed :(" <> tshow f
+
+githubUpdate' :: DummyArr () ()
+githubUpdate' = proc () -> do
+    owner <- load' "owner" -< ()
+    branch <- (load' "branch" <+> arr (const "master")) -< ()
+    set' "branch" -< branch
+    bar <- arr (<> "-foo") -< owner
+    () <- arr (\(_,_) -> ()) -< (branch, bar)
+    () <- set' "bar" -< bar
+    returnA -< ()
+
+data DummyArr b c where
+  Id :: DummyArr a a
+  Comp :: (Comp b c) -> DummyArr b c
+  Arr :: (b -> c) -> DummyArr b c
+  First :: DummyArr b c -> DummyArr (b, d) (c, d)
+  Zero :: DummyArr b c
+  Plus :: DummyArr b c -> DummyArr b c -> DummyArr b c
+  Check' :: (a -> Bool) -> DummyArr a ()
+  Load' :: T.Text -> DummyArr () T.Text
+  Set' :: T.Text -> DummyArr T.Text ()
+  Io' :: (a -> IO b)  -> DummyArr a b
+
+instance Show (DummyArr b c) where
+  show = \case
+    Id -> "Id"
+    Comp (Com l r)-> "Comp (" <> show l <> "," <> show r <> ")"
+    Arr _f -> "Arr"
+    First a -> "First (" <> show a <> ")"
+    Zero -> "Zero"
+    Plus l r -> "Plus (" <> show l <> "," <> show r <> ")"
+    Check' _ch -> "Check"
+    Load' k -> "Load " <> T.unpack k
+    Set' k -> "Set " <> T.unpack k
+    Io' _act -> "Io"
+
+data Comp a c = forall b. Com (DummyArr b c) (DummyArr a b)
+
+instance Cat.Category DummyArr where
+    id = Id
+    f . g = Comp (Com f g)
+
+instance Arrow DummyArr where
+    arr = Arr
+    first = First
+
+instance ArrowZero DummyArr where
+    zeroArrow = Zero
+
+instance ArrowPlus DummyArr where
+    (<+>) = Plus
+
+runDummy :: Foo -> DummyArr () a -> IO (Foo, a)
+runDummy foo a = runDummy' foo a >>= feed
+  where
+    feed = \case
+      ArrDone v -> pure v
+      ArrFailed e -> error $ "Baaa: " <> show e
+      ArrMoar next -> next () >>= feed
+
+data Fail
+  = FailNoSuchKey T.Text
+  | FailKeyLocked T.Text
+  | FailKeySetted T.Text
+  | FailZero
+  | FailCheck
+  deriving Show
+
+data ArrRes a b
+  = ArrDone (Foo, b)
+  | ArrFailed Fail
+  | ArrMoar (a -> IO (ArrRes () b))
+  deriving Functor
+
+
+cmap :: (c -> a) -> ArrRes a b -> ArrRes c b
+cmap f = \case
+  ArrDone r -> ArrDone r
+  ArrFailed e -> ArrFailed e
+  ArrMoar g -> ArrMoar $ g . f
+
+runDummy' :: Foo -> DummyArr a b -> IO (ArrRes a b)
+runDummy' foo = \case
+    Id -> pure $ ArrMoar $ \v -> pure $ ArrDone (foo, v)
+    Comp (Com f g) -> do
+      runDummy' foo g >>= \case
+        ArrDone (foo', v') -> runDummy' foo' f >>= \case
+          ArrMoar next -> cmap (const ()) <$> next v'
+          ArrFailed e -> pure $ ArrFailed e
+          ArrDone res -> pure $ ArrDone res
+        ArrFailed e -> pure $ ArrFailed e
+        ArrMoar next -> pure $ ArrMoar $ \v -> fix (\lp go -> do
+          go >>= \case
+            ArrDone (foo', v') -> runDummy' foo' f >>= \case
+              ArrDone res -> pure $ ArrDone res
+              ArrFailed e -> pure $ ArrFailed e
+              ArrMoar next' -> cmap (const ()) <$> next' v'
+            ArrFailed e -> pure $ ArrFailed e
+            ArrMoar next' -> pure $ ArrMoar $ \v' -> lp $ next' v'
+          ) (next v)
+    Arr f -> pure $ ArrMoar $ \v -> pure $ ArrDone (foo, f v)
+    First a -> pure $ ArrMoar $ \v -> do
+      let (v', d) = v
+      runDummy' foo a >>= \case
+        ArrDone (foo', v'') -> pure $ ArrDone (foo', (v'', d))
+        ArrFailed e -> pure $ ArrFailed e
+        ArrMoar next -> fmap (,d) <$> next v'
+    Zero -> pure $ ArrFailed FailZero
+    Plus l r ->
+      runDummy' foo l >>= \case
+        ArrDone v' -> pure $ ArrDone v'
+        ArrFailed {} -> runDummy' foo r -- TODO: all?
+        ArrMoar next -> pure $ ArrMoar next
+    Check' ch -> pure $ ArrMoar $ \v -> do
+      if ch v then pure (ArrDone (foo, ())) else pure $ ArrFailed FailCheck
+    Load' k -> do
+      case lookupVal k foo of
+        Just v' -> pure $ ArrDone (foo, v')
+        Nothing -> pure $ ArrFailed $ FailNoSuchKey k
+    Set' k -> case HMS.lookup k foo of
+      Just Locked{} -> pure $ ArrFailed $ FailKeyLocked k
+      Just Free{} -> pure $ ArrMoar $ \v ->
+        pure $ ArrDone (foo <> HMS.singleton k (Setted v), ())
+      Just Setted{} -> pure $ ArrFailed $ FailKeySetted k
+      Nothing -> pure $ ArrMoar $ \v ->
+        pure $ ArrDone (foo <> HMS.singleton k (Setted v), ())
+    Io' act -> pure $ ArrMoar $ \v -> do
+      v' <- act v
+      pure $ ArrDone (foo, v')
+
+test1' :: IO ()
+test1' = do
+    void $ runDummy foo $ proc () -> do
+      returnA -< ()
+  where
+    foo = HMS.empty
+
+test2' :: IO ()
+test2' = do
+    (_, v) <- runDummy foo $
+      let
+        l = proc () -> do returnA -< 2
+        r = proc () -> do returnA -< 3
+      in l <+> r
+    unless (v == (2::Int)) (error "bad value")
+  where
+    foo = HMS.empty
+
+test3' :: IO ()
+test3' = do
+    (_, v) <- runDummy foo $ load' "foo"
+    unless (v == ("bar"::T.Text)) (error "bad value")
+  where
+    foo = HMS.singleton "foo" (Locked "bar")
+
+test4' :: IO ()
+test4' = do
+    (_, v) <- runDummy foo $ proc () -> do
+      fooo -< ()
+      load' "res" -< ()
+    unless (v == ("I saw right"::T.Text)) (error "bad value")
+  where
+    foo = HMS.singleton "val" (Locked "right")
+
+fooo :: DummyArr () ()
+fooo = one <+> two
+  where
+    one :: DummyArr () ()
+    one = proc () -> do
+      val <- load' "val" -< ()
+      check' (== "left") -< val
+      set' "res" -< "I saw left"
+      returnA -< ()
+    two :: DummyArr () ()
+    two = proc () -> do
+      val <- load' "val" -< ()
+      check' (== "right") -< val
+      set' "res" -< "I saw right"
+      returnA -< ()
+
+check' :: (a -> Bool) -> DummyArr a ()
+check' = Check'
+
+load' :: T.Text -> DummyArr () T.Text
+load' = Load'
+
+set' :: T.Text -> DummyArr T.Text ()
+set' = Set'
+
+io' :: (a -> IO b) -> DummyArr a b
+io' = Io'
 
 githubUpdate :: Result ()
 githubUpdate = do
