@@ -157,35 +157,34 @@ parsePackage = (,) <$> parsePackageName <*> parsePackageSpec
 -- PACKAGE SPEC OPS
 -------------------------------------------------------------------------------
 
-type Foo = HMS.HashMap T.Text Val
+-- type Foo = HMS.HashMap T.Text Val
+type Foo' = HMS.HashMap T.Text (Freedom, IO T.Text)
+type Foo'' = HMS.HashMap T.Text (Freedom, T.Text)
 
-data Val
-  = Locked (IO T.Text)
-  | Free (IO T.Text)
+foo'2foo :: Foo' -> IO Foo''
+foo'2foo = traverse (\(fr, v) -> (fr,) <$> v)
 
-data Failure
-  = AltEmpty
-  | NoSuchKey T.Text
+foo2foo' :: Foo'' -> Foo'
+foo2foo' = fmap (\(fr, v) -> (fr, pure v))
+
+data Freedom
+  = Locked'
+  | Free'
   deriving Show
-
-lookupVal :: T.Text -> Foo -> Maybe (IO T.Text)
-lookupVal k m = case HMS.lookup k m of
-  Nothing -> Nothing
-  Just v -> Just $ case v of
-    Locked t -> t
-    Free t -> t
 
 githubUpdate' :: DummyArr () ()
 githubUpdate' = proc () -> do
     owner <- load' "owner" -< ()
     repo <- load' "repo" -< ()
     branch <- setOrUse "branch" -< "master"
-    rev <- io' (\(a,b,c) -> githubLatestRev a b c) -< (,,) <$> owner <*> repo <*> branch
+    rev <- io' (\(a,b,c) -> githubLatestRev a b c) -<
+      (,,) <$> owner <*> repo <*> branch
     url <- update "url" -< "github.com" <> owner <> repo <> branch <> rev
-    let isTar = fmap ("tar.gz" `T.isSuffixOf`) url
+    let isTar = ("tar.gz" `T.isSuffixOf`) <$> url
     setOrUse "type" -< bool "file" "tarball" <$> isTar
     let doUnpack = isTar
-    sha256' <- io' (\(up, u) -> nixPrefetchURL up (T.unpack u)) -< (,) <$> doUnpack <*> url
+    sha256' <- io' (\(up, u) -> nixPrefetchURL up (T.unpack u)) -<
+      (,) <$> doUnpack <*> url
     update "sha256" -< T.pack <$> sha256'
     returnA -< ()
 
@@ -232,15 +231,14 @@ instance ArrowZero DummyArr where
 instance ArrowPlus DummyArr where
     (<+>) = Plus
 
-runDummy :: Foo -> DummyArr () a -> IO (Foo, ())
-runDummy foo a = runDummy' foo a >>= feed
+runDummy :: Foo'' -> DummyArr () a -> IO (Foo'', a)
+runDummy (foo2foo' -> foo) a = runDummy' foo a >>= feed
   where
     feed = \case
       ArrReady res -> hndl res
-      ArrMoar next -> next (pure ()) >>= hndl
+      ArrMoar next -> next (()) >>= hndl
     hndl = \case
-      ArrDone f v -> do
-        pure (f, ())
+      ArrDone f v -> (,v) <$> foo'2foo f
       ArrFailed e -> error $ "baaaah: " <> show e
 
 runVol :: Vol a -> IO a
@@ -257,11 +255,11 @@ data Fail
 
 data ArrRes a b
   = ArrReady (ArrResult b)
-  | ArrMoar (Vol a -> IO (ArrResult b))
+  | ArrMoar (a -> IO (ArrResult b))
   deriving Functor
 
 data ArrResult b
-  = ArrDone Foo (Vol b)
+  = ArrDone Foo' b
   | ArrFailed Fail
   deriving Functor
 
@@ -278,7 +276,7 @@ instance Applicative Vol where
   Vol b1 f <*> Vol b2 v = Vol (b1 || b2) (f v)
 
 instance Semigroup a => Semigroup (Vol a) where
-  (<>) = undefined
+  (<>) = liftA2 (<>)
 
 instance IsString (Vol T.Text) where
   fromString = Vol False . T.pack
@@ -286,14 +284,13 @@ instance IsString (Vol T.Text) where
 cmap :: (c -> a) -> ArrRes a b -> ArrRes c b
 cmap f = \case
   ArrReady r -> ArrReady r
-  ArrMoar g -> ArrMoar $ g . fmap f
+  ArrMoar g -> ArrMoar $ g . f
 
-runDummy' :: Foo -> DummyArr a b -> IO (ArrRes a b)
+-- TODO: tryAny all IOs
+runDummy' :: Foo' -> DummyArr a b -> IO (ArrRes a b)
 runDummy' foo = \case
-    Id -> pure (ArrMoar $ \v -> do
-      pure (ArrDone foo v))
-    Arr f -> pure $ ArrMoar $ \v -> do
-      pure (ArrDone foo (f <$> v))
+    Id -> pure $ ArrMoar $ pure . ArrDone foo
+    Arr f -> pure $ ArrMoar $ pure . ArrDone foo . f
     Zero -> pure $ ArrReady (ArrFailed FailZero)
     Plus l r -> runDummy' foo l >>= \case
       ArrReady (ArrFailed{}) -> runDummy' foo r
@@ -304,64 +301,49 @@ runDummy' foo = \case
           ArrReady res -> pure res
           ArrMoar next' -> next' v
     Load' k -> pure $ ArrReady $ do
-      case lookupVal k foo of
-        Just v' -> ArrDone foo (pure $ VolIO False v') -- (Vol False v')
+      case HMS.lookup k foo of
+        Just (_, v') -> ArrDone foo (VolIO False v')
         Nothing -> ArrFailed $ FailNoSuchKey k
     First a -> do
       runDummy' foo a >>= \case
         ArrReady (ArrFailed e) -> pure $ ArrReady $ ArrFailed e
         ArrReady (ArrDone fo ba) -> pure $ ArrMoar $ \gtt -> do
-          pure $ ArrDone fo $ (,) <$> ba <*> (snd <$> gtt)
-        ArrMoar next -> pure $ ArrMoar $ \gtt -> do -- do (b, d) ->
-          next (fst <$> gtt) >>= \case
+          pure $ ArrDone fo (ba, snd gtt)
+        ArrMoar next -> pure $ ArrMoar $ \gtt -> do
+          next (fst gtt) >>= \case
             ArrFailed e -> pure $ ArrFailed e
             ArrDone f res -> do
-              pure $ ArrDone f $ (,) <$> res <*> (snd <$> gtt)
+              pure $ ArrDone f (res, snd gtt)
     Io' act -> pure (ArrMoar $ \gtt -> do
-      pure $ ArrDone foo $ VolIO False $ do
-        putStrLn "bazz"
-        v <- runVol gtt
-        putStrLn "bozz"
-        v' <- runVol v
-        putStrLn "bizz"
-        -- res <- act v'
-        putStrLn "bezz"
-        pure (VolIO False (act v')))
-      -- pure $ ArrDone foo $ VolIO False $ runVol gtt >>= act)
-    -- Check' ch -> pure (ArrMoar $ \gtt -> do
-      -- putStrLn "BAAZ"
-      -- v <- runVol gtt -- XXX: think have to run here
-      -- if ch v
-      -- then pure (ArrDone foo (pure ()))
-      -- else pure (ArrFailed FailCheck))
+      pure $ ArrDone foo $ VolIO False (act =<< runVol gtt))
+    Check' ch -> pure (ArrMoar $ \gtt -> do
+      v <- runVol gtt
+      if ch v
+      then pure $ ArrDone foo ()
+      else pure $ ArrFailed FailCheck)
     SetOrUse k -> pure $ case HMS.lookup k foo of
-      Just (Locked v) -> ArrReady $ ArrDone foo (pure $ VolIO False v) -- ArrDone foo (Vol False v)
-      Just (Free v) -> ArrReady $ ArrDone foo (pure $ VolIO False v) --  ArrDone foo (Vol False v)
+      Just (Locked', v) -> ArrReady $ ArrDone foo (VolIO False v)
+      Just (Free', v) -> ArrReady $ ArrDone foo (VolIO False v)
       Nothing -> ArrMoar $ \gtt -> do
-        putStrLn "BAAZZZZZ"
-        v <- runVol gtt
-        let foo' = HMS.singleton k (Locked $ runVol v) <> foo
-        pure $ ArrDone foo' (pure $ v)
+        let io = runVol gtt
+        let foo' = HMS.singleton k (Locked', io) <> foo
+        pure $ ArrDone foo' gtt
     Update k -> pure $ case HMS.lookup k foo of
-      Just (Locked v) -> ArrReady $ undefined -- ArrDone foo (pure v)
-      Just (Free {}) -> ArrMoar $ \gtt -> do
-        v <- runVol gtt
-        putStrLn "plep"
-        let foo' = HMS.singleton k (Locked $ runVol v) <> foo
-        pure $ ArrDone foo' (pure $ v)
+      Just (Locked', v) -> ArrReady $ ArrDone foo (VolIO False v)
+      Just (Free', _v) -> ArrMoar $ \gtt -> do
+        let io = runVol gtt
+        let foo' = HMS.singleton k (Locked', io) <> foo
+        pure $ ArrDone foo' gtt
       Nothing -> ArrMoar $ \gtt -> do
-        putStrLn "plop"
-        v <- runVol gtt
-        putStrLn "plap"
-        let foo' = HMS.singleton k (Locked $ runVol v) <> foo
-        pure $ ArrDone foo' (pure $ v)
+        let io = runVol gtt
+        let foo' = HMS.singleton k (Locked', io) <> foo
+        pure $ ArrDone foo' gtt
     Comp (Com f g) -> runDummy' foo g >>= \case
       ArrReady (ArrFailed e) -> pure $ ArrReady $ ArrFailed e
       ArrReady (ArrDone foo' act) -> runDummy' foo' f >>= \case
         ArrReady (ArrFailed e) -> pure $ ArrReady $ ArrFailed e
         ArrReady (ArrDone foo'' act') -> pure $ ArrReady $ ArrDone foo'' act'
-        ArrMoar next -> do
-          undefined -- res
+        ArrMoar next -> ArrReady <$> next act
       ArrMoar next -> pure $ ArrMoar $ \gtt -> do
         next gtt >>= \case
           ArrFailed e -> pure $ ArrFailed e
@@ -380,66 +362,67 @@ test = do
   putStrLn "test 7" >> test7
 
 test1' :: IO ()
-test1' = pure ()
-    -- void $ runDummy foo $ proc () -> do
-      -- returnA -< pure ()
-  -- where
-    -- foo = HMS.empty
+test1' =
+    void $ runDummy foo $ proc () -> do
+      returnA -< ()
+  where
+    foo = HMS.empty
 
 test2' :: IO ()
-test2' = pure ()
-
-    -- (_, v) <- runDummy foo $
-      -- let
-        -- l = proc () -> do returnA -< 2
-        -- r = proc () -> do returnA -< 3
-      -- in l <+> r
-    -- unless (v == (2::Int)) (error "bad value")
-  -- where
-    -- foo = HMS.empty
+test2' = do
+    (_, v) <- runDummy foo $
+      let
+        l = proc () -> do returnA -< 2
+        r = proc () -> do returnA -< 3
+      in l <+> r
+    unless (v == (2::Int)) (error "bad value")
+  where
+    foo = HMS.empty
 
 test3' :: IO ()
 test3' = do
     (_, v) <- runDummy foo $ load' "foo"
-    pure ()
-    -- unless (v == "bar") (error "bad value")
+    v' <- runVol v
+    unless (v' == "bar") (error "bad value")
   where
-    foo = HMS.singleton "foo" (Locked $ pure "bar")
+    foo = HMS.singleton "foo" (Locked', "bar")
 
 test4' :: IO ()
 test4' = do
-    -- (_, v) <- runDummy foo $ proc () -> do
-      -- -- fooo -< ()
-      -- load' "res" -< ()
-    pure ()
-    -- unless (v == ("I saw right")) (error "bad value")
-  -- where
-    -- foo = HMS.singleton "val" (Locked "right")
+    (_, v) <- runDummy foo $ proc () -> do
+      fooo -< ()
+      load' "res" -< ()
+    v' <- runVol v
+    unless (v' == ("I saw right")) (error "bad value")
+  where
+    foo = HMS.singleton "val" (Locked', "right")
 
 test5' :: IO ()
 test5' = do
-    -- let f = io' (const $ error "IO is too eager (f)") >>> setOrUse "foo"
+    let f = arr (const $ pure ()) >>>
+              io' (const $ error "IO is too eager (f)") >>>
+              setOrUse "foo"
     let f1 = proc () -> do
               io' (const $ error "IO is too eager (f1)") -< pure ()
               setOrUse "foo" -< "foo"
-    -- void $ runDummy foo f
+    void $ runDummy foo f
     print f1
     void $ runDummy foo f1
   where
-    foo = HMS.singleton "foo" (Locked $ pure "right")
+    foo = HMS.singleton "foo" (Locked', "right")
 
 test6' :: IO ()
 test6' = do
     let f = arr (\() -> "world") >>> update "hello"
     print f
-    (foo', _v) <- runDummy foo f
-    pure ()
-    -- print v
-    -- unless (lookupVal "hello" foo' == Just "world") $
-      -- error $ "bad value for hello: " <> show foo'
-    -- print foo'
+    (foo', v) <- runDummy foo f
+    v' <- runVol v
+    print v'
+    unless ((snd <$> HMS.lookup "hello" foo') == Just "world") $
+      error $ "bad value for hello: " <> show foo'
+    print foo'
   where
-    foo = HMS.singleton "hello" (Free $ pure "foo")
+    foo = HMS.singleton "hello" (Free', "foo")
 
 fooo :: DummyArr () ()
 fooo = one <+> two
@@ -464,19 +447,19 @@ test7 = do
           io' (\() -> error "io shouldn't be run") -< pure ()
     print f
     (foo', _) <- runDummy foo f
-    -- unless (lookupVal "hello" foo' == Just "world") $
-      -- error $ "bad value for hello: " <> show foo'
+    unless ((snd <$> HMS.lookup "hello" foo') == Just "world") $
+      error $ "bad value for hello: " <> show foo'
     let f' = proc () -> do
           io' (\() -> error "io shouldn't be run") -< pure ()
           update "hello" -< "world"
     print f'
-    (foo', _) <- runDummy foo f'
-    -- unless (lookupVal "hello" foo' == Just "world") $
-      -- error $ "bad value for hello: " <> show foo'
-    pure ()
-    -- print foo'
+    (foo'', _) <- runDummy foo f'
+    unless ((snd <$> HMS.lookup "hello" foo'') == Just "world") $
+      error $ "bad value for hello: " <> show foo''
+    print foo'
+    print foo''
   where
-    foo = HMS.singleton "hello" (Free (pure "foo")) <> HMS.singleton "x" (Free (pure "baz"))
+    foo = HMS.singleton "hello" (Free', "foo") <> HMS.singleton "x" (Free', "baz")
 
 check' :: (a -> Bool) -> DummyArr (Vol a) ()
 check' = Check'
