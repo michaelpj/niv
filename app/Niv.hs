@@ -154,54 +154,10 @@ parsePackage = (,) <$> parsePackageName <*> parsePackageSpec
 -- PACKAGE SPEC OPS
 -------------------------------------------------------------------------------
 
-data Result a where
-  Pure :: a -> Result a
-  Check :: Check -> (Result a) -> Result a
-  Failed  :: Failure -> Result a
-  Io :: Io a -> Result a
-  Set :: T.Text -> Result T.Text -> Result ()
-  Load :: T.Text -> Result T.Text
-  App :: (App a) -> Result a
-  Alt :: Result a -> Result a -> Result a
-
-check :: Result a -> (a -> Bool) -> Result b -> Result b
-check r ch next = Check (Chec r ch) next
-
-data Check = forall b. Chec (Result b) (b -> Bool)
-
-data Io a = forall b. I (Result b) (b -> IO a)
-
-instance Functor Io where
-  fmap f (I r i) = I r (fmap f . i)
-
-data App a = forall b. Ap (Result (b -> a)) (Result b)
-
-instance Functor App where
-  fmap f (Ap l r) = Ap (fmap (f .) l) r
-
-instance Alternative Result where
-  empty = Failed AltEmpty
-  l <|> r = Alt l r
-
-instance Functor Result where
-  fmap f (Pure x) = Pure (f x)
-  fmap f (Check c next) = Check c (f <$> next)
-  fmap f (Io x) = Io $ f <$> x
-  fmap f (Set k v) = App $ Ap (Pure f) (Set k v)
-  fmap f (Load k) = App $ Ap (Pure f) (Load k)
-  fmap _ (Failed f) = Failed f
-  fmap f (App t) = App (fmap f t)
-  fmap f (Alt l r) = Alt (f <$> l) (f <$> r)
-
-instance Applicative Result where
-  pure = Pure
-  l <*> r = App (Ap l r)
-
 type Foo = HMS.HashMap T.Text Val
 
 data Val
   = Locked T.Text
-  | Setted T.Text
   | Free T.Text
   deriving (Eq, Show)
 
@@ -210,248 +166,25 @@ data Failure
   | NoSuchKey T.Text
   deriving Show
 
-execResult :: Foo -> Result a -> IO a
-execResult foo r = snd <$> runResult foo r
-
-runResult :: Foo -> Result a -> IO (Foo, a)
-runResult foo r = runResult' foo r >>= \case
-  Left f -> error $ show f
-  Right v -> pure v
-
-runResult' :: Foo -> Result a -> IO (Either Failure (Foo, a))
-runResult' foo = \case
-  (Pure x) -> pure $ Right (foo, x)
-  (Check (Chec v ch) next) -> do
-    runResult' foo v >>= \case
-      Left f -> pure $ Left f
-      Right (foo', v') ->
-        if ch v'
-        then runResult' foo' next
-        else pure $ Left AltEmpty
-  (Io (I r i)) -> do
-    runResult' foo r >>= \case
-      Left f -> pure $ Left f
-      Right (foo', v) -> do
-        v' <- i v
-        runResult' foo' (Pure v')
-  (Set k v) -> do
-    case HMS.lookup k foo of
-      Just (Locked {}) -> pure $ Right (foo, ()) -- TODO: failed locked?
-      _ -> runResult' foo v >>= \case
-        Left f -> pure $ Left f
-        Right (foo', v') -> pure $ Right $
-          (HMS.singleton k (Setted v') <> foo', ())
-  (Load k) -> case lookupVal k foo of
-    Just v -> runResult' foo (Pure v) -- TODO
-    Nothing -> pure $ Left (NoSuchKey k) -- TODO
-  (App (Ap l r)) -> do
-    runResult' foo l >>= \case
-      Left f -> pure $ Left f
-      Right (foo', f) -> fmap (fmap f) <$> runResult' foo' r
-  Failed f -> pure $ Left f
-  Alt l r -> do
-    runResult' foo l >>= \case
-      Left AltEmpty -> runResult' foo r
-      Left f -> pure $ Left f
-      Right v -> pure $ Right v
-
 lookupVal :: T.Text -> Foo -> Maybe T.Text
 lookupVal k m = case HMS.lookup k m of
   Nothing -> Nothing
   Just v -> Just $ case v of
     Locked t -> t
-    Setted t -> t
     Free t -> t
-
-test :: IO ()
-test = do
-  test1
-  test2
-  test3
-  test4
-  test5
-  test6
-  test7
-
-test1 :: IO ()
-test1 = do
-    res <- execResult foo $ pure 2
-    print (res :: Int)
-    unless (res == 2) $ error "bad value"
-  where
-    foo = HMS.empty
-
-test2 :: IO ()
-test2 = do
-    res <- execResult foo $ do
-      load "bar"
-    T.putStrLn res
-    unless (res == "baz") $ error "bad value"
-  where
-    foo = HMS.singleton "bar" (Free "baz")
-
-test3 :: IO ()
-test3 = do
-    res <- execResult foo $ do
-      3 <$ empty <|> pure 2
-    print (res :: Int)
-    unless (res == 2) $ error "bad value"
-  where
-    foo = HMS.empty
-
-test4 :: IO ()
-test4 = do
-    (foo', ()) <- runResult foo $ do
-      set "baz" (pure "foo")
-    unless (HMS.lookup "baz" foo' == Just (Setted "foo")) $ error "bad value"
-  where
-    foo = HMS.singleton "baz" (Free "not-foo")
-
-test5 :: IO ()
-test5 = do
-    (foo', ()) <- runResult foo $
-
-      (check (load "val") (== "left") $
-        set "res" (pure "I saw left")
-        ) <|> (check (load "val") (== "right") $
-        set "res" (pure "I saw right")
-        )
-
-    print foo'
-    unless
-      (HMS.lookup "res" foo' == Just (Setted "I saw right"))
-      (error "bad value")
-  where
-    foo = HMS.singleton "val" (Free "right")
-
-test6 :: IO ()
-test6 = do
-    (foo', ()) <- runResult foo $ do
-
-      let branch = load "branch" <|> pure "master" -- LOAD or master
-      set "branch" branch
-      let url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
-
-      set "url_template" (pure url_template) -- SET the url_template, even if it exists, unless locked
-
-      set "rev" $ io (pure ()) $ \() ->  pure "foobar" -- ("some-rev" <> owner <> repo <> branch)
-
-      pure ()
-
-    print foo'
-  where
-    foo = HMS.fromList
-      [ ("owner", Free "nmattia")
-      , ("repo", Free "niv")
-      , ("branch", Free "master")
-      ]
-
-test7 :: IO ()
-test7 = do
-    let fooz = do
-          let
-            owner = load "owner"
-            repo = load "repo"
-            branch = load "branch" <|> pure "master"
-          set "branch" branch
-          let url_template = pure "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
-
-          set "url_template" url_template -- SET the url_template, even if it exists, unless locked
-
-          set "rev" $ io ((,,) <$> owner <*> repo <*> branch) $
-            \(_, _, _) -> pure "foobar"
-
-
-          set "foo" (pure "bar")
-          pure ()
-
-    T.putStrLn $ describe fooz
-
-    (foo', ()) <- runResult foo $ fooz
-    print foo'
-    unless (HMS.lookup "rev" foo' == Just (Locked "basic")) $ error "bad"
-  where
-    foo = HMS.fromList
-      [ ("owner", Free "nmattia")
-      , ("repo", Free "niv")
-      , ("branch", Free "master")
-      , ("rev", Locked "basic")
-      ]
-
-test8 :: IO ()
-test8 = do
-    let fooz = do
-          let
-            new = pure "new"
-          set "val1" $ fmap ("1-" <>) new
-          set "val2" $ fmap ("2-" <>) new
-          pure ()
-
-    T.putStrLn $ describe fooz
-
-    (foo', ()) <- runResult foo $ fooz
-    print foo'
-    unless
-      ( HMS.lookup "val1" foo' == Just (Locked "1-old") &&
-        HMS.lookup "val2" foo' == Just (Locked "2-old")
-      ) $ error "bad"
-  where
-    foo = HMS.fromList
-      [ ("val1", Free "1-old")
-      , ("val2", Locked "2-old")
-      ]
-
-test9 :: IO ()
-test9 = do
-    let fooz = set "foo" (io (pure ()) (\() -> error "baz"))
-
-    T.putStrLn $ describe fooz
-
-    (foo', ()) <- runResult foo $ fooz
-    print foo'
-  where
-    foo = HMS.singleton "foo" (Locked "something")
-
-test9' :: IO ()
-test9' = do
-    let f = io' (const $ error "IO is too eager") >>> setOrUse "foo"
-    print f
-    (foo', v) <- runDummy foo f
-    print v
-    print foo'
-  where
-    foo = HMS.singleton "foo" (Locked "right")
-
-load :: T.Text -> Result T.Text
-load k = Load k
-
-set :: T.Text -> Result T.Text -> Result ()
-set k v = Set k v
-
-io :: Result a -> (a -> IO b) -> Result b
-io r f = Io (I r f)
-
-describe :: Result a -> T.Text
-describe = \case
-  (Alt r l) -> "Alt!" <> describe l <> describe r
-  (Check _ _) -> "Check!"
-  (Pure _) -> "Pure!"
-  (Io _) -> "IO!"
-  (Set k v) -> "Setting " <> k <> " to " <> describe v
-  (Load k) -> "Loading " <> k
-  (App (Ap l r)) -> "App!" <>
-    "(L " <> describe l <> ")" <>
-    "(R " <> describe r <> ")"
-  Failed f -> "Failed :(" <> tshow f
 
 githubUpdate' :: DummyArr () ()
 githubUpdate' = proc () -> do
     owner <- load' "owner" -< ()
-    branch <- (load' "branch" <+> arr (const "master")) -< ()
-    set' "branch" -< branch
-    bar <- arr (<> "-foo") -< owner
-    () <- arr (\(_,_) -> ()) -< (branch, bar)
-    () <- set' "bar" -< bar
+    repo <- load' "repo" -< ()
+    branch <- setOrUse "branch" -< "master"
+    rev <- io' (\(a,b,c) -> githubLatestRev a b c) -< (owner, repo, branch)
+    url <- update "url" -< "github.com" <> owner <> repo <> branch <> rev
+    let isTar = "tar.gz" `T.isSuffixOf` url
+    setOrUse "type" -< if isTar then "tarball" else "file"
+    let doUnpack = isTar
+    sha256' <- io' (\(up, u) -> nixPrefetchURL up (T.unpack u)) -< (doUnpack, url)
+    update "sha256" -< T.pack sha256'
     returnA -< ()
 
 data DummyArr b c where
@@ -463,8 +196,8 @@ data DummyArr b c where
   Plus :: DummyArr b c -> DummyArr b c -> DummyArr b c
   Check' :: (a -> Bool) -> DummyArr a ()
   Load' :: T.Text -> DummyArr () T.Text
-  Set' :: T.Text -> DummyArr T.Text ()
   SetOrUse :: T.Text -> DummyArr T.Text T.Text
+  Update :: T.Text -> DummyArr T.Text T.Text
   Io' :: (a -> IO b)  -> DummyArr a b
 
 instance Show (DummyArr b c) where
@@ -477,8 +210,8 @@ instance Show (DummyArr b c) where
     Plus l r -> "Plus (" <> show l <> "," <> show r <> ")"
     Check' _ch -> "Check"
     Load' k -> "Load " <> T.unpack k
-    Set' k -> "Set " <> T.unpack k
     SetOrUse k -> "SetOrUse " <> T.unpack k
+    Update k -> "Update " <> T.unpack k
     Io' _act -> "Io"
 
 data Comp a c = forall b. Com (DummyArr b c) (DummyArr a b)
@@ -509,8 +242,7 @@ runDummy foo a = runDummy' foo a >>= feed
 
 data Fail
   = FailNoSuchKey T.Text
-  | FailKeyLocked T.Text
-  | FailKeySetted T.Text
+  | FailBadIo SomeException
   | FailZero
   | FailCheck
   deriving Show
@@ -544,7 +276,6 @@ runDummy' foo = \case
           ArrReady res -> pure res
           ArrMoar next' -> next' v
     Load' k -> pure $ ArrReady $ do
-      -- TODO: fail on "setted"
       case lookupVal k foo of
         Just v' -> ArrDone foo (pure v')
         Nothing -> ArrFailed $ FailNoSuchKey k
@@ -560,63 +291,49 @@ runDummy' foo = \case
       if ch v
       then pure (ArrDone foo (pure ()))
       else pure (ArrFailed FailCheck))
-    Set' k -> pure $ case HMS.lookup k foo of
-      Just Locked{} -> ArrReady $ ArrFailed $ FailKeyLocked k
-      Just Free{} -> ArrMoar $ \v -> do
-        let foo' = foo <> HMS.singleton k (Setted v)
-        pure $ ArrDone foo' (pure ())
-      Just Setted{} -> ArrReady $ ArrFailed $ FailKeySetted k
-      Nothing -> ArrMoar $ \v -> do
-        let foo' = foo <> HMS.singleton k (Setted v)
-        pure $ ArrDone foo' (pure ())
     SetOrUse k -> pure $ case HMS.lookup k foo of
       Just (Locked v) -> ArrReady $ ArrDone foo (pure v)
-      Just Free{} -> ArrMoar $ \v -> do
-        let foo' = foo <> HMS.singleton k (Setted v)
-        pure $ ArrDone foo' (pure v)
-      Just Setted{} -> ArrReady $ ArrFailed $ FailKeySetted k
+      Just (Free v) -> ArrReady $ ArrDone foo (pure v)
       Nothing -> ArrMoar $ \v -> do
-        let foo' = foo <> HMS.singleton k (Setted v)
+        let foo' = HMS.singleton k (Locked v) <> foo
         pure $ ArrDone foo' (pure v)
-
+    Update k -> pure $ case HMS.lookup k foo of
+      Just (Locked v) -> ArrReady $ ArrDone foo (pure v)
+      Just (Free {}) -> ArrMoar $ \v -> do
+        let foo' = HMS.singleton k (Locked v) <> foo
+        pure $ ArrDone foo' (pure v)
+      Nothing -> ArrMoar $ \v -> do
+        let foo' = HMS.singleton k (Locked v) <> foo
+        pure $ ArrDone foo' (pure v)
     Comp (Com f g) -> runDummy' foo g >>= \case
       ArrReady (ArrFailed e) -> pure $ ArrReady $ ArrFailed e
       ArrReady (ArrDone foo' act) -> runDummy' foo' f >>= \case
         ArrReady (ArrFailed e) -> pure $ ArrReady $ ArrFailed e
         ArrReady (ArrDone foo'' act') -> pure $ ArrReady $ ArrDone foo'' act'
-        ArrMoar next -> ArrReady <$> (act >>= next)
+        ArrMoar next -> tryAny act >>= \case
+          Left e -> do
+            putStrLn "ONE"
+            pure $ ArrReady $ ArrFailed (FailBadIo e)
+          Right r -> ArrReady <$> next r
       ArrMoar next -> pure $ ArrMoar $ \v -> next v >>= \case
         ArrFailed e -> pure $ ArrFailed e
         ArrDone foo' act -> runDummy' foo' f >>= \case
           ArrReady ready -> pure ready
-          ArrMoar next' -> act >>= next'
-    -- runDummy' foo f >>= \case
-      -- ArrReady res -> pure $ ArrReady res -- TODO: merge state from G
-      -- _ -> undefined
-      -- ArrMoar next -> runDummy' foo g >> \case
-        -- _ -> undefined
-        -- ArrReady res' ->
+          ArrMoar next' -> do
+            putStrLn "TWO"
+            tryAny act >>= \case
+              Left e -> pure $ ArrFailed (FailBadIo e)
+              Right v' -> next' v'
 
-    -- Comp (Com f g) -> runDummy' foo f >>= \case
-      -- ArrDone (foo', res') -> runDummy' foo' g >>= fix (\lp -> \case
-        -- ArrDone (foo'', _) -> pure $ ArrDone (foo'', res')
-        -- ArrFailed e -> pure $ ArrFailed e
-        -- ArrMoar gnext -> pure $ ArrMoar $ \v -> do
-          -- gnext v >>= lp
-          -- )
-      -- ArrFailed e -> pure $ ArrFailed e
-      -- ArrMoar fnext -> runDummy' foo g >>= \case
-        -- ArrMoar gnext -> pure $ ArrMoar $ \v -> gnext v >>= \case
-          -- ArrDone (_, res') -> fnext res' >>= \case
-            -- ArrDone (f, res'') -> pure $ ArrDone (f, res'')
-            -- ArrFailed e -> pure $ ArrFailed e
-            -- _ -> undefined
-
-        -- ArrFailed e -> pure $ ArrFailed e
-        -- ArrDone (foo', res) -> fnext res >>= \case
-          -- ArrDone (foo'', res') -> pure $ ArrDone (foo'', res') -- TODO: merge states
-          -- ArrFailed e -> pure $ ArrFailed e
-          -- _ -> undefined
+test :: IO ()
+test = do
+  test1'
+  test2'
+  test3'
+  test4'
+  test5'
+  test6'
+  test7
 
 test1' :: IO ()
 test1' = do
@@ -639,7 +356,7 @@ test2' = do
 test3' :: IO ()
 test3' = do
     (_, v) <- runDummy foo $ load' "foo"
-    unless (v == ("bar"::T.Text)) (error "bad value")
+    unless (v == "bar") (error "bad value")
   where
     foo = HMS.singleton "foo" (Locked "bar")
 
@@ -652,6 +369,30 @@ test4' = do
   where
     foo = HMS.singleton "val" (Locked "right")
 
+test5' :: IO ()
+test5' = do
+    let f = io' (const $ error "IO is too eager (f)") >>> setOrUse "foo"
+    let f1 = proc () -> do
+              () <- io' (const $ error "IO is too eager (f1)") -< ()
+              setOrUse "foo" -< "foo"
+    void $ runDummy foo f
+    print f1
+    void $ runDummy foo f1
+  where
+    foo = HMS.singleton "foo" (Locked "right")
+
+test6' :: IO ()
+test6' = do
+    let f = arr (\() -> "world") >>> update "hello"
+    print f
+    (foo', v) <- runDummy foo f
+    print v
+    unless (lookupVal "hello" foo' == Just "world") $
+      error $ "bad value for hello: " <> show foo'
+    print foo'
+  where
+    foo = HMS.singleton "hello" (Free "foo")
+
 fooo :: DummyArr () ()
 fooo = one <+> two
   where
@@ -659,14 +400,29 @@ fooo = one <+> two
     one = proc () -> do
       val <- load' "val" -< ()
       check' (== "left") -< val
-      set' "res" -< "I saw left"
+      setOrUse "res" -< "I saw left"
       returnA -< ()
     two :: DummyArr () ()
     two = proc () -> do
       val <- load' "val" -< ()
       check' (== "right") -< val
-      set' "res" -< "I saw right"
+      setOrUse "res" -< "I saw right"
       returnA -< ()
+
+test7 :: IO ()
+test7 = do
+    let f = proc () -> do
+          update "hello" -< "old"
+          io' (\() -> error "io shouldn't be run") -< ()
+          returnA -< ()
+    print f
+    (foo', v) <- runDummy foo f
+    print v
+    unless (lookupVal "hello" foo' == Just "world") $
+      error $ "bad value for hello: " <> show foo'
+    print foo'
+  where
+    foo = HMS.singleton "hello" (Free "foo")
 
 check' :: (a -> Bool) -> DummyArr a ()
 check' = Check'
@@ -674,38 +430,14 @@ check' = Check'
 load' :: T.Text -> DummyArr () T.Text
 load' = Load'
 
-set' :: T.Text -> DummyArr T.Text ()
-set' = Set'
-
 setOrUse :: T.Text -> DummyArr T.Text T.Text
 setOrUse = SetOrUse
 
+update :: T.Text -> DummyArr T.Text T.Text
+update = Update
+
 io' :: (a -> IO b) -> DummyArr a b
 io' = Io'
-
-githubUpdate :: Result ()
-githubUpdate = do
-    let
-      owner = load "owner"
-      repo = load "repo"
-      branch = load "branch" <|> pure "master" -- LOAD or master
-      url_template = "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
-
-    set "branch" branch -- SET the branch
-    set "url_template" (pure url_template) -- SET the url_template, even if it exists, unless locked
-
-    let rev = io
-                ((,,) <$> owner <*> repo <*> branch) $
-                \(o,r,b) -> githubLatestRev o r b
-
-    -- SET the rev, even if it exists, unless the rev is locked
-    set "rev" rev
-
-    let url = pure "someurl"
-    set "url" url
-    set "sha256" $ io url $ \u -> T.pack <$> nixPrefetchURL True (T.unpack u)
-
-    pure ()
 
 updatePackageSpec :: PackageSpec -> IO PackageSpec
 updatePackageSpec = execStateT $ do
