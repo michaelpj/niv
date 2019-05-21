@@ -516,64 +516,74 @@ data Fail
 data ArrRes a b
   = ArrDone (Foo, b)
   | ArrFailed Fail
-  | ArrMoar (a -> IO (ArrRes () b))
+  | ArrMoar (a -> IO (ArrRes a b))
   deriving Functor
-
 
 cmap :: (c -> a) -> ArrRes a b -> ArrRes c b
 cmap f = \case
   ArrDone r -> ArrDone r
   ArrFailed e -> ArrFailed e
-  ArrMoar g -> ArrMoar $ g . f
+  ArrMoar next -> ArrMoar $ \v -> do
+    fmap (cmap f) (next (f v))
 
 runDummy' :: Foo -> DummyArr a b -> IO (ArrRes a b)
 runDummy' foo = \case
-    Id -> pure $ ArrMoar $ \v -> pure $ ArrDone (foo, v)
-    Comp (Com f g) -> do
-      runDummy' foo g >>= \case
-        ArrDone (foo', v') -> runDummy' foo' f >>= \case
-          ArrMoar next -> cmap (const ()) <$> next v'
-          ArrFailed e -> pure $ ArrFailed e
-          ArrDone res -> pure $ ArrDone res
+    Id -> pure (ArrMoar $ \v -> pure (ArrDone (foo, v)))
+    Arr f -> pure $ ArrMoar $ \v -> pure (ArrDone (foo, f v))
+    Zero -> pure (ArrFailed FailZero)
+    Plus l r -> runDummy' foo l >>= fix (\lop -> \case
+            ArrDone res -> pure $ ArrDone res
+            ArrFailed {} -> runDummy' foo r
+            ArrMoar next -> pure $ ArrMoar $ next >=> lop
+        )
+    First a -> do
+      res <- runDummy' foo a
+      pure $ ArrMoar $ \(_, d) -> pure $ cmap fst $ fmap (,d) res
+    Comp (Com f g) -> runDummy' foo f >>= \case
+      ArrDone (foo', res') -> runDummy' foo' g >>= fix (\lp -> \case
+        ArrDone (foo'', _) -> pure $ ArrDone (foo'', res')
         ArrFailed e -> pure $ ArrFailed e
-        ArrMoar next -> pure $ ArrMoar $ \v -> fix (\lp go -> do
-          go >>= \case
-            ArrDone (foo', v') -> runDummy' foo' f >>= \case
-              ArrDone res -> pure $ ArrDone res
-              ArrFailed e -> pure $ ArrFailed e
-              ArrMoar next' -> cmap (const ()) <$> next' v'
+        ArrMoar gnext -> pure $ ArrMoar $ \v -> do
+          gnext v >>= lp
+          )
+      ArrFailed e -> pure $ ArrFailed e
+      ArrMoar fnext -> runDummy' foo g >>= \case
+        ArrMoar gnext -> pure $ ArrMoar $ \v -> gnext v >>= \case
+          ArrDone (_, res') -> fnext res' >>= \case
+            ArrDone (f, res'') -> pure $ ArrDone (f, res'')
             ArrFailed e -> pure $ ArrFailed e
-            ArrMoar next' -> pure $ ArrMoar $ \v' -> lp $ next' v'
-          ) (next v)
-    Arr f -> pure $ ArrMoar $ \v -> pure $ ArrDone (foo, f v)
-    First a -> pure $ ArrMoar $ \v -> do
-      let (v', d) = v
-      runDummy' foo a >>= \case
-        ArrDone (foo', v'') -> pure $ ArrDone (foo', (v'', d))
+            _ -> undefined
+
         ArrFailed e -> pure $ ArrFailed e
-        ArrMoar next -> fmap (,d) <$> next v'
-    Zero -> pure $ ArrFailed FailZero
-    Plus l r ->
-      runDummy' foo l >>= \case
-        ArrDone v' -> pure $ ArrDone v'
-        ArrFailed {} -> runDummy' foo r -- TODO: all?
-        ArrMoar next -> pure $ ArrMoar next
-    Check' ch -> pure $ ArrMoar $ \v -> do
-      if ch v then pure (ArrDone (foo, ())) else pure $ ArrFailed FailCheck
+        ArrDone (foo', res) -> fnext res >>= \case
+          ArrDone (foo'', res') -> pure $ ArrDone (foo'', res') -- TODO: merge states
+          ArrFailed e -> pure $ ArrFailed e
+          _ -> undefined
+
+    Check' ch -> pure (ArrMoar $ \v ->
+      if ch v
+      then pure (ArrDone (foo, ()))
+      else pure (ArrFailed FailCheck))
     Load' k -> do
+      -- TODO: fail on "setted"
       case lookupVal k foo of
-        Just v' -> pure $ ArrDone (foo, v')
-        Nothing -> pure $ ArrFailed $ FailNoSuchKey k
+        Just v' -> pure (ArrDone (foo, v'))
+        Nothing -> pure (ArrFailed $ FailNoSuchKey k)
     Set' k -> case HMS.lookup k foo of
-      Just Locked{} -> pure $ ArrFailed $ FailKeyLocked k
-      Just Free{} -> pure $ ArrMoar $ \v ->
-        pure $ ArrDone (foo <> HMS.singleton k (Setted v), ())
-      Just Setted{} -> pure $ ArrFailed $ FailKeySetted k
-      Nothing -> pure $ ArrMoar $ \v ->
-        pure $ ArrDone (foo <> HMS.singleton k (Setted v), ())
-    Io' act -> pure $ ArrMoar $ \v -> do
+      Just Locked{} -> pure (ArrFailed $ FailKeyLocked k)
+      Just Free{} -> pure (ArrMoar $ \v -> do
+        let foo' = foo <> HMS.singleton k (Setted v)
+        pure (ArrDone (foo', ()))
+        )
+      Just Setted{} -> pure (ArrFailed $ FailKeySetted k)
+      Nothing -> pure (ArrMoar $ \v -> do
+        let foo' = foo <> HMS.singleton k (Setted v)
+        pure (ArrDone (foo', ()))
+        )
+    Io' act -> pure (ArrMoar $ \v -> do
       v' <- act v
-      pure $ ArrDone (foo, v')
+      pure (ArrDone (foo, v'))
+      )
 
 test1' :: IO ()
 test1' = do
