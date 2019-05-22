@@ -177,7 +177,7 @@ githubUpdate' = proc () -> do
     owner <- load' "owner" -< ()
     repo <- load' "repo" -< ()
     branch <- setOrUse "branch" -< "master"
-    rev <- io' (\(a,b,c) -> githubLatestRev a b c) -<
+    rev <- io'' (\(a,b,c) -> githubLatestRev a b c) -<
       (,,) <$> owner <*> repo <*> branch
     url <- update "url" -< "github.com" <> owner <> repo <> branch <> rev
     let isTar = ("tar.gz" `T.isSuffixOf`) <$> url
@@ -242,9 +242,7 @@ runDummy (foo2foo' -> foo) a = runDummy' foo a >>= feed
       ArrFailed e -> error $ "baaaah: " <> show e
 
 runVol :: Vol a -> IO a
-runVol = \case
-  Vol _ x -> pure x
-  VolIO _ x -> x
+runVol = volOp
 
 data Fail
   = FailNoSuchKey T.Text
@@ -263,23 +261,24 @@ data ArrResult b
   | ArrFailed Fail
   deriving Functor
 
-data Vol a
-  = VolIO Bool (IO a)
-  | Vol Bool a
+data Vol a = Vol
+  { volNew :: Bool
+  , volOp :: IO a
+  }
   deriving Functor
 
 instance Applicative Vol where
-  pure = Vol False
-  VolIO b1 f <*> VolIO b2 v = VolIO (b1 || b2) (f <*> v)
-  Vol b1 f <*> VolIO b2 v = VolIO (b1 || b2) (pure f <*> v)
-  VolIO b1 f <*> Vol b2 v = VolIO (b1 || b2) (f <*> pure v)
-  Vol b1 f <*> Vol b2 v = Vol (b1 || b2) (f v)
+  pure x = Vol { volNew = False, volOp = pure x }
+  f <*> v = Vol
+    { volNew = volNew f || volNew v
+    , volOp = volOp f <*> volOp v
+    }
 
 instance Semigroup a => Semigroup (Vol a) where
   (<>) = liftA2 (<>)
 
 instance IsString (Vol T.Text) where
-  fromString = Vol False . T.pack
+  fromString str = Vol { volNew = False, volOp = pure $ T.pack str }
 
 cmap :: (c -> a) -> ArrRes a b -> ArrRes c b
 cmap f = \case
@@ -302,7 +301,7 @@ runDummy' foo = \case
           ArrMoar next' -> next' v
     Load' k -> pure $ ArrReady $ do
       case HMS.lookup k foo of
-        Just (_, v') -> ArrDone foo (VolIO False v')
+        Just (_, v') -> ArrDone foo (Vol { volNew = False, volOp =  v' })
         Nothing -> ArrFailed $ FailNoSuchKey k
     First a -> do
       runDummy' foo a >>= \case
@@ -315,25 +314,28 @@ runDummy' foo = \case
             ArrDone f res -> do
               pure $ ArrDone f (res, snd gtt)
     Io' act -> pure (ArrMoar $ \gtt -> do
-      pure $ ArrDone foo $ VolIO False (act =<< runVol gtt))
+      pure $ ArrDone foo $ Vol False (act =<< runVol gtt))
     Check' ch -> pure (ArrMoar $ \gtt -> do
       v <- runVol gtt
       if ch v
       then pure $ ArrDone foo ()
       else pure $ ArrFailed FailCheck)
     SetOrUse k -> pure $ case HMS.lookup k foo of
-      Just (Locked', v) -> ArrReady $ ArrDone foo (VolIO False v)
-      Just (Free', v) -> ArrReady $ ArrDone foo (VolIO False v)
+      Just (Locked', v) -> ArrReady $ ArrDone foo (Vol False v)
+      Just (Free', v) -> ArrReady $ ArrDone foo (Vol False v)
       Nothing -> ArrMoar $ \gtt -> do
         let io = runVol gtt
         let foo' = HMS.singleton k (Locked', io) <> foo
         pure $ ArrDone foo' gtt
     Update k -> pure $ case HMS.lookup k foo of
-      Just (Locked', v) -> ArrReady $ ArrDone foo (VolIO False v)
-      Just (Free', _v) -> ArrMoar $ \gtt -> do
-        let io = runVol gtt
-        let foo' = HMS.singleton k (Locked', io) <> foo
-        pure $ ArrDone foo' gtt
+      Just (Locked', v) -> ArrReady $ ArrDone foo (Vol False v)
+      Just (Free', v) -> ArrMoar $ \gtt -> do
+        if volNew gtt
+        then do
+          let io = runVol gtt
+          let foo' = HMS.singleton k (Locked', io) <> foo
+          pure $ ArrDone foo' gtt
+        else pure $ ArrDone foo (Vol False v)
       Nothing -> ArrMoar $ \gtt -> do
         let io = runVol gtt
         let foo' = HMS.singleton k (Locked', io) <> foo
@@ -360,6 +362,7 @@ test = do
   putStrLn "test 5" >> test5'
   putStrLn "test 6" >> test6'
   putStrLn "test 7" >> test7
+  putStrLn "test 8" >> test8
 
 test1' :: IO ()
 test1' =
@@ -413,7 +416,7 @@ test5' = do
 
 test6' :: IO ()
 test6' = do
-    let f = arr (\() -> "world") >>> update "hello"
+    let f = arr (\() -> "world" { volNew = True} ) >>> update "hello"
     print f
     (foo', v) <- runDummy foo f
     v' <- runVol v
@@ -459,7 +462,19 @@ test7 = do
     print foo'
     print foo''
   where
-    foo = HMS.singleton "hello" (Free', "foo") <> HMS.singleton "x" (Free', "baz")
+    foo = HMS.empty
+
+test8 :: IO ()
+test8 = do
+    (_,v3) <- runDummy foo $ proc () -> do
+          v1 <- update "hello" -< "world"
+          v2 <- io' (\_ -> error "io shouldn't be run") -< v1
+          v3 <- update "bar" -< v2
+          returnA -< v3
+    v3' <- runVol v3
+    unless (v3' == "baz") $ error "bad value"
+  where
+    foo = HMS.fromList [("hello", (Free', "world")), ("bar", (Free', "baz"))]
 
 check' :: (a -> Bool) -> DummyArr (Vol a) ()
 check' = Check'
@@ -475,6 +490,10 @@ update = Update
 
 io' :: (a -> IO b) -> DummyArr (Vol a) (Vol b)
 io' = Io'
+
+-- | Like 'io'' but forces evaluation
+io'' :: (a -> IO b) -> DummyArr (Vol a) (Vol b)
+io'' act = Io' act >>> arr (\v -> v { volNew = True})
 
 updatePackageSpec :: PackageSpec -> IO PackageSpec
 updatePackageSpec = execStateT $ do
