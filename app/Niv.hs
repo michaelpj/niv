@@ -168,18 +168,14 @@ foo2foo' :: Foo'' -> Foo'
 foo2foo' = fmap (\(fr, v) -> (fr, pure v))
 
 data Freedom
-  = Locked'
-  | Free'
+  = Locked
+  | Free
   deriving Show
 
 githubUpdate' :: DummyArr () ()
 githubUpdate' = proc () -> do
-    owner <- load' "owner" -< ()
-    repo <- load' "repo" -< ()
-    branch <- setOrUse "branch" -< "master"
-    rev <- io'' (\(a,b,c) -> githubLatestRev a b c) -<
-      (,,) <$> owner <*> repo <*> branch
-    url <- update "url" -< "github.com" <> owner <> repo <> branch <> rev
+    urlTemplate <- template <<< completeSpec -< ()
+    url <- update "url" -< urlTemplate -- "github.com" <> owner <> repo <> branch <> rev
     let isTar = ("tar.gz" `T.isSuffixOf`) <$> url
     setOrUse "type" -< bool "file" "tarball" <$> isTar
     let doUnpack = isTar
@@ -187,6 +183,15 @@ githubUpdate' = proc () -> do
       (,) <$> doUnpack <*> url
     update "sha256" -< T.pack <$> sha256'
     returnA -< ()
+  where
+    completeSpec :: DummyArr () (Vol T.Text)
+    completeSpec = proc () -> do
+      owner <- load' "owner" -< ()
+      repo <- load' "repo" -< ()
+      branch <- setOrUse "branch" -< "master" -- TODO: fetch branch, descr, etc
+      _ <- io'' (\(a,b,c) -> githubLatestRev a b c) -<
+        (,,) <$> owner <*> repo <*> branch
+      setOrUse "url_template" -< pure githubURLTemplate
 
 data DummyArr b c where
   Id :: DummyArr a a
@@ -200,6 +205,7 @@ data DummyArr b c where
   SetOrUse :: T.Text -> DummyArr (Vol T.Text) (Vol T.Text)
   Update :: T.Text -> DummyArr (Vol T.Text) (Vol T.Text)
   Io' :: (a -> IO b)  -> DummyArr (Vol a) (Vol b)
+  Template :: DummyArr (Vol T.Text) (Vol T.Text)
 
 instance Show (DummyArr b c) where
   show = \case
@@ -214,6 +220,7 @@ instance Show (DummyArr b c) where
     SetOrUse k -> "SetOrUse " <> T.unpack k
     Update k -> "Update " <> T.unpack k
     Io' _act -> "Io"
+    Template -> "Template"
 
 data Comp a c = forall b. Com (DummyArr b c) (DummyArr a b)
 
@@ -249,6 +256,7 @@ data Fail
   | FailBadIo SomeException
   | FailZero
   | FailCheck
+  | FailTemplate T.Text [T.Text]
   deriving Show
 
 data ArrRes a b
@@ -321,24 +329,24 @@ runDummy' foo = \case
       then pure $ ArrDone foo ()
       else pure $ ArrFailed FailCheck)
     SetOrUse k -> pure $ case HMS.lookup k foo of
-      Just (Locked', v) -> ArrReady $ ArrDone foo (Vol False v)
-      Just (Free', v) -> ArrReady $ ArrDone foo (Vol False v)
+      Just (Locked, v) -> ArrReady $ ArrDone foo (Vol False v)
+      Just (Free, v) -> ArrReady $ ArrDone foo (Vol False v)
       Nothing -> ArrMoar $ \gtt -> do
         let io = runVol gtt
-        let foo' = HMS.singleton k (Locked', io) <> foo
+        let foo' = HMS.singleton k (Locked, io) <> foo
         pure $ ArrDone foo' gtt
     Update k -> pure $ case HMS.lookup k foo of
-      Just (Locked', v) -> ArrReady $ ArrDone foo (Vol False v)
-      Just (Free', v) -> ArrMoar $ \gtt -> do
+      Just (Locked, v) -> ArrReady $ ArrDone foo (Vol False v)
+      Just (Free, v) -> ArrMoar $ \gtt -> do
         if volNew gtt
         then do
           let io = runVol gtt
-          let foo' = HMS.singleton k (Locked', io) <> foo
+          let foo' = HMS.singleton k (Locked, io) <> foo
           pure $ ArrDone foo' gtt
         else pure $ ArrDone foo (Vol False v)
       Nothing -> ArrMoar $ \gtt -> do
         let io = runVol gtt
-        let foo' = HMS.singleton k (Locked', io) <> foo
+        let foo' = HMS.singleton k (Locked, io) <> foo
         pure $ ArrDone foo' gtt
     Comp (Com f g) -> runDummy' foo g >>= \case
       ArrReady (ArrFailed e) -> pure $ ArrReady $ ArrFailed e
@@ -352,6 +360,11 @@ runDummy' foo = \case
           ArrDone foo' act -> runDummy' foo' f >>= \case
             ArrReady ready -> pure ready
             ArrMoar next' -> next' act
+    Template -> pure $ ArrMoar $ \v -> do
+      v' <- runVol v
+      renderTemplate (\k -> sequence $ snd <$> HMS.lookup k foo) v' >>= \case
+        Nothing -> pure $ ArrFailed $ FailTemplate v' (HMS.keys foo)
+        Just v'' -> pure $ ArrDone foo (pure v'')
 
 test :: IO ()
 test = do
@@ -388,7 +401,7 @@ test3' = do
     v' <- runVol v
     unless (v' == "bar") (error "bad value")
   where
-    foo = HMS.singleton "foo" (Locked', "bar")
+    foo = HMS.singleton "foo" (Locked, "bar")
 
 test4' :: IO ()
 test4' = do
@@ -398,7 +411,7 @@ test4' = do
     v' <- runVol v
     unless (v' == ("I saw right")) (error "bad value")
   where
-    foo = HMS.singleton "val" (Locked', "right")
+    foo = HMS.singleton "val" (Locked, "right")
 
 test5' :: IO ()
 test5' = do
@@ -412,7 +425,7 @@ test5' = do
     print f1
     void $ runDummy foo f1
   where
-    foo = HMS.singleton "foo" (Locked', "right")
+    foo = HMS.singleton "foo" (Locked, "right")
 
 test6' :: IO ()
 test6' = do
@@ -425,7 +438,7 @@ test6' = do
       error $ "bad value for hello: " <> show foo'
     print foo'
   where
-    foo = HMS.singleton "hello" (Free', "foo")
+    foo = HMS.singleton "hello" (Free, "foo")
 
 fooo :: DummyArr () ()
 fooo = one <+> two
@@ -474,7 +487,19 @@ test8 = do
     v3' <- runVol v3
     unless (v3' == "baz") $ error "bad value"
   where
-    foo = HMS.fromList [("hello", (Free', "world")), ("bar", (Free', "baz"))]
+    foo = HMS.fromList [("hello", (Free, "world")), ("bar", (Free, "baz"))]
+
+
+test9 :: IO ()
+test9 = do
+    (_,v3) <- runDummy foo $ proc () -> template -< "<v1>-<v2>"
+    v3' <- runVol v3
+    unless (v3' == "hello-world") $ error "bad value"
+  where
+    foo = HMS.fromList [("v1", (Free, "hello")), ("v2", (Free, "world"))]
+
+template :: DummyArr (Vol T.Text) (Vol T.Text)
+template = Template
 
 check' :: (a -> Bool) -> DummyArr (Vol a) ()
 check' = Check'
@@ -482,6 +507,7 @@ check' = Check'
 load' :: T.Text -> DummyArr () (Vol T.Text)
 load' = Load'
 
+-- TODO: should input really be Vol?
 setOrUse :: T.Text -> DummyArr (Vol T.Text) (Vol T.Text)
 setOrUse = SetOrUse
 
@@ -501,12 +527,12 @@ updatePackageSpec = execStateT $ do
 
     -- Figures out the URL from the template
     withPackageSpecAttr "url_template" (\case
-      Aeson.String (T.unpack -> template) -> do
+      Aeson.String (T.unpack -> tplate) -> do
         packageSpec <- get
         let stringValues = packageSpecStringValues packageSpec
-        case renderTemplate stringValues template of
+        renderTemplate (\k -> pure $ T.pack <$> lookup (T.unpack k) stringValues) (T.pack tplate) >>= \case
           Just renderedURL ->
-            setPackageSpecAttr "url" (Aeson.String $ T.pack renderedURL)
+            setPackageSpecAttr "url" (Aeson.String renderedURL)
           Nothing -> pure ()
       _ -> pure ()
       )
@@ -593,10 +619,9 @@ completePackageSpec = execStateT $ do
         "url_template"
         (Aeson.String githubURLTemplate)
 
-  where
-    githubURLTemplate :: T.Text
-    githubURLTemplate =
-      "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+githubURLTemplate :: T.Text
+githubURLTemplate =
+  "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
 
 -- | Get the latest revision for owner, repo and branch.
 -- TODO: explain no error handling
@@ -949,18 +974,20 @@ mapWithKeyM_ f m = do
 
 -- | Renders the template. Returns 'Nothing' if some of the attributes are
 -- missing.
---
---  renderTemplate [("foo", "bar")] "<foo>" == Just "bar"
---  renderTemplate [("foo", "bar")] "<baz>" == Nothing
-renderTemplate :: [(String, String)] -> String -> Maybe String
+--  TODO: fix doc
+--  renderTemplate [("foo", "bar")] "<foo>" == pure (Just "bar")
+--  renderTemplate [("foo", "bar")] "<baz>" == pure Nothing
+renderTemplate :: Monad m => (T.Text -> m (Maybe T.Text)) -> T.Text -> m (Maybe T.Text)
 renderTemplate vals = \case
-    '<':str -> do
-      case span (/= '>') str of
-        (key, '>':rest) ->
-          liftA2 (<>) (lookup key vals) (renderTemplate vals rest)
-        _ -> Nothing
-    c:str -> (c:) <$> renderTemplate vals str
-    [] -> Just []
+    (T.uncons -> Just ('<', str)) -> do
+      case T.span (/= '>') str of
+        (key, T.uncons -> Just ('>', rest)) -> do
+          v <- vals key
+          liftA2 (<>) v <$> renderTemplate vals rest
+        _ -> pure Nothing
+    (T.uncons -> Just (c, str)) -> fmap (T.cons c) <$> renderTemplate vals str
+    (T.uncons -> Nothing) -> pure $ Just T.empty
+    _ -> pure $ Just T.empty -- XXX: isn't this redundant?
 
 abort :: T.Text -> IO a
 abort msg = do

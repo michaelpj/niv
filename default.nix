@@ -29,7 +29,7 @@ with rec
       shellHook =
         ''
           repl() {
-            ghci app/Niv.hs
+            ghci -Wall app/Niv.hs
           }
 
           echo "To start a REPL session, run:"
